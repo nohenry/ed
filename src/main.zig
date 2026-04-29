@@ -82,10 +82,13 @@ pub fn main(init: std.process.Init) !void {
 
     var rope = ed.Rope.init(arena.allocator());
     rope.loadString("what the hell are you doing");
-    rope.insertString(7, "1234", scratch.allocator());
-    rope.insertString(15, "bruhv", scratch.allocator());
-    rope.insertString(0, "foobar", scratch.allocator());
-    // rope.insertString(rope.len, "fricku", scratch.allocator());
+    rope.insertString(7, "1234");
+    rope.insertString(18, "bruhv");
+    // rope.insertString(13, "im tthirten");
+
+    // rope.rebalance(scratch.allocator());
+    // rope.insertString(0, "foobar");
+    // rope.insertString(rope.len, "fricku");
 
     std.debug.print("ffooba\n", .{});
     var i = rope.iter(std.heap.page_allocator);
