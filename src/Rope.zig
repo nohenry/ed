@@ -3,18 +3,35 @@ const builtin = @import("builtin");
 pub const Self = @This();
 
 pub const Node = struct {
-    // str: union(enum) {
-    //     allocated: std.ArrayList(u8),
-    //     read_only: []const u8,
-    // },
-    str: []const u8,
+    pub const String = union(enum) {
+        allocated: std.ArrayList(u8),
+        read_only: []const u8,
+
+        pub const empty = String{ .read_only = "" };
+
+        pub fn len(self: *const String) usize {
+            return switch (self.*) {
+                .allocated => |list| list.items.len,
+                .read_only => |slice| slice.len,
+            };
+        }
+
+        pub fn items(self: *const String) []const u8 {
+            return switch (self.*) {
+                .allocated => |list| list.items,
+                .read_only => |slice| slice,
+            };
+        }
+    };
+
+    string: String,
     total_length: usize,
     left: ?*Node = null,
     right: ?*Node = null,
 
     pub inline fn init(node: *Node, left: ?*Node, right: ?*Node) *Node {
         node.* = .{
-            .str = "",
+            .string = .empty,
             .total_length = (if (left) |l| l.total_length else 0) + if (right) |r| r.total_length else 0,
             .left = left,
             .right = right,
@@ -24,12 +41,12 @@ pub const Node = struct {
 
     pub inline fn isLeaf(self: *const Node) bool {
         if (builtin.mode == .Debug) {
-            if (self.str.len == 0)
+            if (self.string.len() == 0)
                 std.debug.assert(self.left != null or self.right != null)
             else
                 std.debug.assert(self.left == null and self.right == null);
         }
-        return self.str.len != 0;
+        return self.string.len() != 0;
     }
 
     pub fn getNonLeafs(self: *Node, scratch: std.mem.Allocator) std.ArrayList(*Node) {
@@ -68,21 +85,21 @@ pub fn init(allocator: std.mem.Allocator) Self {
 pub fn loadEmpty(self: *Self) void {
     const node = self.node_pool.create(self.allocator) catch @panic("OOM");
     node.* = .{
-        .str = &.{},
+        .string = .empty,
         .total_length = 0,
     };
     self.root = node;
     self.len = 0;
 }
 
-pub fn loadString(self: *Self, str: []const u8) void {
+pub fn loadString(self: *Self, string: []const u8) void {
     const node = self.node_pool.create(self.allocator) catch @panic("OOM");
     node.* = .{
-        .str = str,
-        .total_length = str.len,
+        .string = .{ .read_only = string },
+        .total_length = string.len,
     };
     self.root = node;
-    self.len = str.len;
+    self.len = string.len;
 }
 
 pub fn createNode(self: *Self, left: ?*Node, right: ?*Node) *Node {
@@ -91,18 +108,14 @@ pub fn createNode(self: *Self, left: ?*Node, right: ?*Node) *Node {
     return node;
 }
 
-pub fn createLeafNode(self: *Self, string: []const u8) *Node {
+pub fn createLeafNode(self: *Self, string: Node.String) *Node {
     const node = self.node_pool.create(self.allocator) catch @panic("OOM");
     node.* = .{
-        .str = string,
-        .total_length = string.len,
+        .string = string,
+        .total_length = string.len(),
     };
     return node;
 }
-
-// pub fn insert(self: *Self, index: usize, codepoint: u32) void {
-
-// }
 
 pub fn rebalance(self: *Self, scratch: std.mem.Allocator) void {
     if (self.root) |root| {
@@ -158,10 +171,24 @@ pub fn rebalanceImpl(self: *Self, reuse_non_leafs: *[]const *Node, nodes: []cons
 
 pub fn split(self: *Self, node: *Node, index: usize) struct { *Node, *Node } {
     if (node.isLeaf()) {
-        const new_right = self.createLeafNode(node.str[index..]);
-        node.str = node.str[0..index];
-        node.total_length = node.str.len;
-        return .{ node, new_right };
+        switch (node.string) {
+            .allocated => |list| {
+                // We reuse the the current node's allocated for the lhs, and create a new allocated for rhs
+                var allocated_list = std.ArrayList(u8).empty;
+                allocated_list.appendSlice(self.allocator, list.items[index..]) catch @panic("OOM");
+
+                const new_right = self.createLeafNode(.{ .allocated = allocated_list });
+                node.string.allocated.items.len = index;
+                node.total_length = index;
+                return .{ node, new_right };
+            },
+            .read_only => |slice| {
+                const new_right = self.createLeafNode(.{ .read_only = slice[index..] });
+                node.string = .{ .read_only = slice[0..index] };
+                node.total_length = index;
+                return .{ node, new_right };
+            },
+        }
     }
 
     const midpoint = if (node.left) |left| left.total_length else 0;
@@ -181,49 +208,47 @@ pub fn split(self: *Self, node: *Node, index: usize) struct { *Node, *Node } {
     }
 }
 
+/// Inserts the given string at the given index.
+/// String is copied, and an allocated node is inserted.
+///
+/// The root node must not be empty.
 pub fn insertString(self: *Self, index: usize, string: []const u8) void {
-    const current = self.root orelse {
-        self.loadString(string);
-        return;
-    };
+    std.debug.assert(self.root != null);
+    const current = self.root.?;
+
+    var allocated_list = std.ArrayList(u8).empty;
+    allocated_list.appendSlice(self.allocator, string) catch @panic("OOM");
+
+    const allocated_string = Node.String{ .allocated = allocated_list };
 
     defer self.len += string.len;
     if (index == 0) {
-        return self.prependString(string);
+        return self.prependString(allocated_string);
     } else if (index == self.len) {
-        return self.appendString(string);
+        return self.appendString(allocated_string);
     }
 
     var lhs, var rhs = self.split(current, index);
     if (self.balance_state % 2 == 0) {
-        lhs = self.createNode(lhs, self.createLeafNode(string));
+        lhs = self.createNode(lhs, self.createLeafNode(allocated_string));
     } else {
-        rhs = self.createNode(self.createLeafNode(string), rhs);
+        rhs = self.createNode(self.createLeafNode(allocated_string), rhs);
     }
     self.balance_state += 1;
     self.root = self.createNode(lhs, rhs);
 }
 
-fn prependString(self: *Self, string: []const u8) void {
+fn prependString(self: *Self, string: Node.String) void {
     var current = self.root;
     var parent: ?*Node = null;
     while (current != null and !current.?.isLeaf()) {
         parent = current;
-        current.?.total_length += string.len;
+        current.?.total_length += string.len();
         current = current.?.left;
     }
 
     const new_left = self.createLeafNode(string);
     if (parent) |p| {
-        // const left_len = current.?.str.len;
-
-        // Rebalance
-        // current = self.root;
-        // while (current != null and !current.?.isLeaf()) {
-        //     current.?.weight = current.?.weight - left_len + string.len;
-        //     current = current.?.left;
-        // }
-
         if (p.left) |left| {
             const new_parent = self.createNode(new_left, left);
             p.left = new_parent;
@@ -237,7 +262,7 @@ fn prependString(self: *Self, string: []const u8) void {
     }
 }
 
-fn appendString(self: *Self, string: []const u8) void {
+fn appendString(self: *Self, string: Node.String) void {
     var current = self.root;
     var parent: ?*Node = null;
     while (current != null and !current.?.isLeaf()) {
@@ -284,7 +309,7 @@ pub fn dumpGraph(self: *Self, writer: *std.Io.Writer) !void {
 pub fn dumpGraphImpl(self: *Self, node: *Node, id: usize, writer: *std.Io.Writer) !usize {
     const my_id = id;
     if (node.isLeaf()) {
-        try writer.print("node{} [label=\"{}\\n{s}\"];\n", .{ my_id, node.total_length, node.str });
+        try writer.print("node{} [label=\"{}\\n{s}\"];\n", .{ my_id, node.total_length, node.string.items() });
 
         return id + 1;
     } else {
@@ -316,7 +341,7 @@ pub const Iterator = struct {
     pub fn next(self: *Iterator) ?u32 {
         const current = self.stack.getLastOrNull() orelse return null;
 
-        if (self.index >= current.str.len) {
+        if (self.index >= current.string.len()) {
             var left = self.stack.pop() orelse return null;
 
             if (self.stack.pop()) |parent| {
@@ -333,14 +358,14 @@ pub const Iterator = struct {
                 }
             } else return null;
 
-            const length = std.unicode.utf8ByteSequenceLength(left.str[0]) catch @panic("invalid utf8");
-            const codepoint = std.unicode.utf8Decode(left.str[0..length]) catch @panic("invalid utf8");
+            const length = std.unicode.utf8ByteSequenceLength(left.string.items()[0]) catch @panic("invalid utf8");
+            const codepoint = std.unicode.utf8Decode(left.string.items()[0..length]) catch @panic("invalid utf8");
             defer self.index = length;
 
             return @as(u32, codepoint);
         } else {
-            const length = std.unicode.utf8ByteSequenceLength(current.str[self.index]) catch @panic("invlaid utf8");
-            const codepoint = std.unicode.utf8Decode(current.str[self.index .. self.index + length]) catch @panic("invalid utf8");
+            const length = std.unicode.utf8ByteSequenceLength(current.string.items()[self.index]) catch @panic("invlaid utf8");
+            const codepoint = std.unicode.utf8Decode(current.string.items()[self.index .. self.index + length]) catch @panic("invalid utf8");
             defer self.index += length;
 
             return @as(u32, codepoint);
