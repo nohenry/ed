@@ -1,0 +1,23 @@
+digraph {
+node0 [label="18"];
+node1 [label="17"];
+node2 [label="13"];
+node3 [label="6"];
+node4 [label="6\nfoobar"];
+node3 -> node4
+node5 [label="7\nwhat th"];
+node3 -> node5
+node2 -> node3
+node6 [label="4"];
+node7 [label="4\n1234"];
+node6 -> node7
+node8 [label="4\ne he"];
+node6 -> node8
+node2 -> node6
+node1 -> node2
+node9 [label="5\nbruhv"];
+node1 -> node9
+node0 -> node1
+node10 [label="16\nll are you doing"];
+node0 -> node10
+}

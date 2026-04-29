@@ -1,0 +1,152 @@
+const std = @import("std");
+const Io = std.Io;
+
+const editor = @import("editor");
+
+const win32 = @import("win32");
+
+const directx = @import("directx/directx.zig");
+const ed = @import("ed.zig");
+
+comptime {
+    _ = ed;
+}
+
+fn window_proc(hwnd: win32.HWND, message: win32.UINT, wparam: win32.WPARAM, lparam: win32.LPARAM) callconv(.c) win32.LRESULT {
+    const application: ?*Application = @ptrFromInt(@as(usize, @bitCast(win32.GetWindowLongPtrA(hwnd, win32.GWLP_USERDATA))));
+    switch (message) {
+        win32.WM_CLOSE => {
+            application.?.keep_running = false;
+            _ = win32.DestroyWindow(hwnd);
+            return 0;
+        },
+        else => {},
+        // win32.WM_KEYDOWN
+    }
+    return win32.DefWindowProcA(hwnd, message, wparam, lparam);
+}
+
+pub const Application = struct {
+    hwnd: win32.HWND = null,
+    keep_running: bool = true,
+
+    pub fn initPinned(self: *Application) void {
+        const hinstance = win32.GetModuleHandleA(null);
+        const class_name = "my_cool_editor_class_name";
+        const window_class = win32.WNDCLASSEXA{
+            .cbSize = @sizeOf(win32.WNDCLASSEXA),
+            .lpfnWndProc = window_proc,
+            .hInstance = hinstance,
+            .hCursor = win32.LoadCursorW(null, 32512),
+            .lpszClassName = class_name,
+        };
+
+        _ = win32.RegisterClassExA(&window_class);
+        _ = win32.SetProcessDPIAware();
+
+        const hwnd = win32.CreateWindowExA(0, class_name, "MyEditor", win32.WS_OVERLAPPEDWINDOW, win32.CW_USEDEFAULT, win32.CW_USEDEFAULT, 1024, 1000, null, null, hinstance, null);
+        _ = win32.ShowWindow(hwnd, win32.SW_SHOW);
+        self.hwnd = hwnd;
+
+        _ = win32.SetWindowLongPtrA(hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
+
+        var renderer = directx.Renderer.new(hwnd, .{});
+        renderer.resize_if_needed(1024, 1000);
+        renderer.start_glyph_placement();
+        renderer.place_glyph(10, 10, &.{'A'}, .red, .green, .red, .none);
+        renderer.end_glyph_placement();
+        renderer.draw();
+    }
+
+    pub fn run(self: *Application) void {
+        while (self.keep_running) {
+            const result = win32.MsgWaitForMultipleObjectsEx(0, null, @bitCast(@as(c_long, -1)), win32.QS_ALLINPUT, win32.MWMO_ALERTABLE);
+
+            if (result == win32.WAIT_OBJECT_0) {
+                var msg: win32.MSG = undefined;
+                while (win32.PeekMessageA(&msg, self.hwnd, 0, 0, win32.PM_REMOVE) > 0) {
+                    _ = win32.TranslateMessage(&msg);
+                    _ = win32.DispatchMessageA(&msg);
+                }
+            }
+        }
+    }
+};
+
+pub fn main(init: std.process.Init) !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+
+    var rope = ed.Rope.init(arena.allocator());
+    rope.loadString("what the hell are you doing");
+    rope.insertString(7, "1234", scratch.allocator());
+    rope.insertString(15, "bruhv", scratch.allocator());
+    rope.insertString(0, "foobar", scratch.allocator());
+    // rope.insertString(rope.len, "fricku", scratch.allocator());
+
+    std.debug.print("ffooba\n", .{});
+    var i = rope.iter(std.heap.page_allocator);
+    while (i.next()) |f| {
+        std.debug.print("char: {u}\n", .{@as(u21, @truncate(f))});
+    }
+    i.deinit();
+
+    var file = try std.Io.Dir.createFile(std.Io.Dir.cwd(), init.io, "output.dot", .{});
+    var buffer: [4096]u8 = undefined;
+    var writer = file.writer(init.io, &buffer);
+
+    try rope.dumpGraph(&writer.interface);
+    try writer.flush();
+    file.close(init.io);
+}
+
+pub fn main2(init: std.process.Init) !void {
+    _ = init;
+
+    var application: Application = .{};
+    application.initPinned();
+
+    application.run();
+}
+
+test "simple test" {
+    const gpa = std.testing.allocator;
+    var list: std.ArrayList(i32) = .empty;
+    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
+    try list.append(gpa, 42);
+    try std.testing.expectEqual(@as(i32, 42), list.pop());
+}
+
+test "fuzz example" {
+    try std.testing.fuzz({}, testOne, .{});
+}
+
+fn testOne(context: void, smith: *std.testing.Smith) !void {
+    _ = context;
+    // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
+
+    const gpa = std.testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    while (!smith.eos()) switch (smith.value(enum { add_data, dup_data })) {
+        .add_data => {
+            const slice = try list.addManyAsSlice(gpa, smith.value(u4));
+            smith.bytes(slice);
+        },
+        .dup_data => {
+            if (list.items.len == 0) continue;
+            if (list.items.len > std.math.maxInt(u32)) return error.SkipZigTest;
+            const len = smith.valueRangeAtMost(u32, 1, @min(32, list.items.len));
+            const off = smith.valueRangeAtMost(u32, 0, @intCast(list.items.len - len));
+            try list.appendSlice(gpa, list.items[off..][0..len]);
+            try std.testing.expectEqualSlices(
+                u8,
+                list.items[off..][0..len],
+                list.items[list.items.len - len ..],
+            );
+        },
+    };
+}
