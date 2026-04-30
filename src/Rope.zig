@@ -1,35 +1,711 @@
 const std = @import("std");
+const Allocator = std.mem.Allocator;
+
 const builtin = @import("builtin");
 pub const Self = @This();
 
-pub const Node = struct {
-    pub const String = union(enum) {
-        allocated: std.ArrayList(u8),
-        read_only: []const u8,
+fn addOrOom(a: usize, b: usize) error{OutOfMemory}!usize {
+    const result, const overflow = @addWithOverflow(a, b);
+    if (overflow != 0) return error.OutOfMemory;
+    return result;
+}
 
-        pub const empty = String{ .read_only = "" };
+pub const GrowableString = struct {
+    /// Contents of the list. This field is intended to be accessed
+    /// directly.
+    ///
+    /// Pointers to elements in this slice are invalidated by various
+    /// functions of this ArrayList in accordance with the respective
+    /// documentation. In all cases, "invalidated" means that the memory
+    /// has been passed to an allocator's resize or free function.
+    items: Slice,
+    /// How many T values this list can hold without allocating
+    /// additional memory.
+    capacity: usize,
+    is_readonly: bool,
 
-        pub fn len(self: *const String) usize {
-            return switch (self.*) {
-                .allocated => |list| list.items.len,
-                .read_only => |slice| slice.len,
-            };
-        }
-
-        pub fn items(self: *const String) []const u8 {
-            return switch (self.*) {
-                .allocated => |list| list.items,
-                .read_only => |slice| slice,
-            };
-        }
+    /// An ArrayList containing no elements.
+    pub const empty: GrowableString = .{
+        .items = &.{},
+        .capacity = 0,
+        .is_readonly = false,
     };
+
+    pub const Slice = []u8;
+
+    pub const SentinelSlice = [:0]u8;
+    pub const alignment = std.mem.Alignment.@"1";
+
+    /// Initialize with capacity to hold exactly `num` elements.
+    /// Deinitialize with `deinit` or `toOwnedSlice`.
+    pub fn initCapacity(gpa: Allocator, num: usize) Allocator.Error!GrowableString {
+        var self: GrowableString = .empty;
+        try self.ensureTotalCapacityPrecise(gpa, num);
+        return self;
+    }
+
+    /// Initialize with externally-managed memory. The buffer determines the
+    /// capacity, and the length is set to zero.
+    ///
+    /// When initialized this way, all functions that accept an Allocator
+    /// argument cause illegal behavior.
+    pub fn initReadonly(buffer: []const u8) GrowableString {
+        return .{
+            .items = @constCast(buffer),
+            .capacity = buffer.len,
+            .is_readonly = true,
+        };
+    }
+
+    /// Release all allocated memory.
+    pub fn deinit(self: *GrowableString, gpa: Allocator) void {
+        gpa.free(self.allocatedSlice());
+        self.* = undefined;
+    }
+
+    /// ArrayList takes ownership of the passed in slice.
+    /// Deinitialize with `deinit` or use `toOwnedSlice`.
+    pub fn fromOwnedSlice(slice: Slice) GrowableString {
+        return GrowableString{
+            .items = slice,
+            .capacity = slice.len,
+        };
+    }
+
+    /// ArrayList takes ownership of the passed in slice.
+    /// Deinitialize with `deinit` or use `toOwnedSlice`.
+    pub fn fromOwnedSliceSentinel(comptime sentinel: u8, slice: [:sentinel]u8) GrowableString {
+        return GrowableString{
+            .items = slice,
+            .capacity = slice.len + 1,
+        };
+    }
+
+    /// The caller owns the returned memory. Empties this ArrayList.
+    /// Its capacity is cleared, making deinit() safe but unnecessary to call.
+    pub fn toOwnedSlice(self: *GrowableString, gpa: Allocator) Allocator.Error!Slice {
+        const old_memory = self.allocatedSlice();
+        if (gpa.remap(old_memory, self.items.len)) |new_items| {
+            self.* = .empty;
+            return new_items;
+        }
+
+        const new_memory = try gpa.alignedAlloc(u8, alignment, self.items.len);
+        @memcpy(new_memory, self.items);
+        self.clearAndFree(gpa);
+        return new_memory;
+    }
+
+    /// The caller owns the returned memory. ArrayList becomes empty.
+    pub fn toOwnedSliceSentinel(self: *GrowableString, gpa: Allocator, comptime sentinel: u8) Allocator.Error!SentinelSlice(sentinel) {
+        // This addition can never overflow because `self.items` can never occupy the whole address space.
+        try self.ensureTotalCapacityPrecise(gpa, self.items.len + 1);
+        self.appendAssumeCapacity(sentinel);
+        errdefer self.items.len -= 1;
+        const result = try self.toOwnedSlice(gpa);
+        return result[0 .. result.len - 1 :sentinel];
+    }
+
+    /// The caller owns the returned memory. Empties this ArrayList.
+    /// Its capacity is cleared, making deinit() safe but unnecessary to call.
+    ///
+    /// Asserts what the capacity is equal to the length.
+    pub fn toOwnedSliceAssert(self: *GrowableString) Slice {
+        std.debug.assert(self.items.len == self.capacity);
+        const items = self.items;
+        self.* = .empty;
+        return items;
+    }
+
+    /// The caller owns the returned memory. ArrayList becomes empty.
+    /// Asserts what the capacity is equal to the length + 1.
+    pub fn toOwnedSliceSentinelAssert(self: *GrowableString, comptime sentinel: u8) SentinelSlice(sentinel) {
+        std.debug.assert(self.items.len + 1 == self.capacity);
+        self.appendAssumeCapacity(sentinel);
+        const result = self.toOwnedSliceAssert();
+        return result[0 .. result.len - 1 :sentinel];
+    }
+
+    /// Creates a copy of this ArrayList.
+    pub fn clone(self: GrowableString, gpa: Allocator) Allocator.Error!GrowableString {
+        var cloned = try GrowableString.initCapacity(gpa, self.capacity);
+        cloned.appendSliceAssumeCapacity(self.items);
+        return cloned;
+    }
+
+    /// Insert `item` at index `i`. Moves `list[i .. list.len]` to higher indices to make room.
+    /// If `i` is equal to the length of the list this operation is equivalent to append.
+    /// This operation is O(N).
+    /// Invalidates element pointers if additional memory is needed.
+    /// Asserts that the index is in bounds or equal to the length.
+    pub fn insert(self: *GrowableString, gpa: Allocator, i: usize, item: u8) Allocator.Error!void {
+        const dst = try self.addManyAt(gpa, i, 1);
+        dst[0] = item;
+    }
+
+    /// Insert `item` at index `i`. Moves `list[i .. list.len]` to higher indices to make room.
+    ///
+    /// If `i` is equal to the length of the list this operation is equivalent to append.
+    ///
+    /// This operation is O(N).
+    ///
+    /// Asserts that the list has capacity for one additional item.
+    ///
+    /// Asserts that the index is in bounds or equal to the length.
+    pub fn insertAssumeCapacity(self: *GrowableString, i: usize, item: u8) void {
+        std.debug.assert(self.items.len < self.capacity);
+        self.items.len += 1;
+
+        @memmove(self.items[i + 1 .. self.items.len], self.items[i .. self.items.len - 1]);
+        self.items[i] = item;
+    }
+
+    /// Add `count` new elements at position `index`, which have
+    /// `undefined` values. Returns a slice pointing to the newly allocated
+    /// elements, which becomes invalid after various `ArrayList`
+    /// operations.
+    /// Invalidates pre-existing pointers to elements at and after `index`.
+    /// Invalidates all pre-existing element pointers if capacity must be
+    /// increased to accommodate the new elements.
+    /// Asserts that the index is in bounds or equal to the length.
+    pub fn addManyAt(self: *GrowableString, index: usize, count: usize) Allocator.Error![]u8 {
+        const new_len = try addOrOom(self.items.len, count);
+
+        if (self.capacity >= new_len)
+            return addManyAtAssumeCapacity(self, index, count);
+
+        // Here we avoid copying allocated but unused bytes by
+        // attempting a resize in place, and falling back to allocating
+        // a new buffer and doing our own copy. With a realloc() call,
+        // the allocator implementation would pointlessly copy our
+        // extra capacity.
+        const new_capacity = GrowableString.growCapacity(new_len);
+        const old_memory = self.allocatedSlice();
+        if (self.allocator.remap(old_memory, new_capacity)) |new_memory| {
+            self.items.ptr = new_memory.ptr;
+            self.capacity = new_memory.len;
+            return addManyAtAssumeCapacity(self, index, count);
+        }
+
+        // Make a new allocation, avoiding `ensureTotalCapacity` in order
+        // to avoid extra memory copies.
+        const new_memory = try self.allocator.alignedAlloc(u8, alignment, new_capacity);
+        const to_move = self.items[index..];
+        @memcpy(new_memory[0..index], self.items[0..index]);
+        @memcpy(new_memory[index + count ..][0..to_move.len], to_move);
+        self.allocator.free(old_memory);
+        self.items = new_memory[0..new_len];
+        self.capacity = new_memory.len;
+        // The inserted elements at `new_memory[index..][0..count]` have
+        // already been set to `undefined` by memory allocation.
+        return new_memory[index..][0..count];
+    }
+
+    /// Add `count` new elements at position `index`, which have
+    /// `undefined` values. Returns a slice pointing to the newly allocated
+    /// elements, which becomes invalid after various `ArrayList`
+    /// operations.
+    /// Invalidates pre-existing pointers to elements at and after `index`, but
+    /// does not invalidate any before that.
+    /// Asserts that the list has capacity for the additional items.
+    /// Asserts that the index is in bounds or equal to the length.
+    pub fn addManyAtAssumeCapacity(self: *GrowableString, index: usize, count: usize) []u8 {
+        const new_len = self.items.len + count;
+        std.debug.assert(self.capacity >= new_len);
+        const to_move = self.items[index..];
+        self.items.len = new_len;
+        @memmove(self.items[index + count ..][0..to_move.len], to_move);
+        const result = self.items[index..][0..count];
+        @memset(result, undefined);
+        return result;
+    }
+
+    /// Insert slice `items` at index `i` by moving `list[i .. list.len]` to make room.
+    /// This operation is O(N).
+    /// Invalidates pre-existing pointers to elements at and after `index`.
+    /// Invalidates all pre-existing element pointers if capacity must be
+    /// increased to accommodate the new elements.
+    /// Asserts that the index is in bounds or equal to the length.
+    pub fn insertSlice(
+        self: *GrowableString,
+        gpa: Allocator,
+        index: usize,
+        items: []const u8,
+    ) Allocator.Error!void {
+        const dst = try self.addManyAt(
+            gpa,
+            index,
+            items.len,
+        );
+        @memcpy(dst, items);
+    }
+
+    /// Insert slice `items` at index `i` by moving `list[i .. list.len]` to make room.
+    /// This operation is O(N).
+    /// Invalidates pre-existing pointers to elements at and after `index`.
+    /// Asserts that the list has capacity for the additional items.
+    /// Asserts that the index is in bounds or equal to the length.
+    pub fn insertSliceAssumeCapacity(
+        self: *GrowableString,
+        index: usize,
+        items: []const u8,
+    ) void {
+        const dst = self.addManyAtAssumeCapacity(index, items.len);
+        @memcpy(dst, items);
+    }
+
+    /// Grows or shrinks the list as necessary.
+    /// Invalidates element pointers if additional capacity is allocated.
+    /// Asserts that the range is in bounds.
+    pub fn replaceRange(
+        self: *GrowableString,
+        gpa: Allocator,
+        start: usize,
+        len: usize,
+        new_items: []const u8,
+    ) Allocator.Error!void {
+        try self.ensureTotalCapacity(gpa, try addOrOom(self.items.len - len, new_items.len));
+        self.replaceRangeAssumeCapacity(start, len, new_items);
+    }
+
+    /// Grows or shrinks the list as necessary.
+    ///
+    /// Never invalidates element pointers.
+    ///
+    /// Asserts the capacity is enough for additional items.
+    pub fn replaceRangeAssumeCapacity(
+        self: *GrowableString,
+        start: usize,
+        len: usize,
+        new_items: []const u8,
+    ) void {
+        std.debug.assert(self.capacity - self.items.len >= new_items.len -| len);
+
+        const tail = self.items[start + len ..];
+        const vacated = self.items[self.items.len - (len -| new_items.len) ..];
+        self.items.len = self.items.len - len + new_items.len;
+        @memmove(self.items[start + new_items.len ..], tail);
+        @memcpy(self.items[start..][0..new_items.len], new_items);
+        @memset(vacated, undefined);
+    }
+
+    /// Extend the list by 1 element. Allocates more memory as necessary.
+    /// Invalidates element pointers if additional memory is needed.
+    pub fn append(self: *GrowableString, gpa: Allocator, item: u8) Allocator.Error!void {
+        const new_item_ptr = try self.addOne(gpa);
+        new_item_ptr.* = item;
+    }
+
+    /// Extend the list by 1 element.
+    ///
+    /// Never invalidates element pointers.
+    ///
+    /// Asserts that the list can hold one additional item.
+    pub fn appendAssumeCapacity(self: *GrowableString, item: u8) void {
+        self.addOneAssumeCapacity().* = item;
+    }
+
+    /// Remove the element at index `i` from the list and return its value.
+    /// Invalidates pointers to the last element.
+    /// This operation is O(N).
+    /// Asserts that the index is in bounds.
+    pub fn orderedRemove(self: *GrowableString, i: usize) u8 {
+        const old_item = self.items[i];
+        self.replaceRangeAssumeCapacity(i, 1, &.{});
+        return old_item;
+    }
+
+    /// Remove the elements indexed by `sorted_indexes`. The indexes to be
+    /// removed correspond to the array list before deletion.
+    ///
+    /// Asserts:
+    /// * Each index to be removed is in bounds.
+    /// * The indexes to be removed are sorted ascending.
+    ///
+    /// Duplicates in `sorted_indexes` are allowed.
+    ///
+    /// This operation is O(N).
+    ///
+    /// Invalidates element pointers beyond the first deleted index.
+    pub fn orderedRemoveMany(self: *GrowableString, sorted_indexes: []const usize) void {
+        if (sorted_indexes.len == 0) return;
+        var shift: usize = 1;
+        for (sorted_indexes[0 .. sorted_indexes.len - 1], sorted_indexes[1..]) |removed, end| {
+            if (removed == end) continue; // allows duplicates in `sorted_indexes`
+            const start = removed + 1;
+            const len = end - start; // safety checks `sorted_indexes` are sorted
+            @memmove(self.items[start - shift ..][0..len], self.items[start..][0..len]); // safety checks initial `sorted_indexes` are in range
+            shift += 1;
+        }
+        const start = sorted_indexes[sorted_indexes.len - 1] + 1;
+        const end = self.items.len;
+        const len = end - start; // safety checks final `sorted_indexes` are in range
+        @memmove(self.items[start - shift ..][0..len], self.items[start..][0..len]);
+        self.items.len = end - shift;
+    }
+
+    /// Removes the element at the specified index and returns it.
+    /// The empty slot is filled from the end of the list.
+    /// Invalidates pointers to last element.
+    /// This operation is O(1).
+    /// Asserts that the index is in bounds.
+    pub fn swapRemove(self: *GrowableString, i: usize) u8 {
+        const val = self.items[i];
+        self.items[i] = self.items[self.items.len - 1];
+        self.items[self.items.len - 1] = undefined;
+        self.items.len -= 1;
+        return val;
+    }
+
+    /// Append the slice of items to the list. Allocates more
+    /// memory as necessary.
+    /// Invalidates element pointers if additional memory is needed.
+    pub fn appendSlice(self: *GrowableString, gpa: Allocator, items: []const u8) Allocator.Error!void {
+        try self.ensureUnusedCapacity(gpa, items.len);
+        self.appendSliceAssumeCapacity(items);
+    }
+
+    /// Append the slice of items to the list.
+    ///
+    /// Asserts that the list can hold the additional items.
+    pub fn appendSliceAssumeCapacity(self: *GrowableString, items: []const u8) void {
+        const old_len = self.items.len;
+        const new_len = old_len + items.len;
+        std.debug.assert(new_len <= self.capacity);
+        self.items.len = new_len;
+        @memcpy(self.items[old_len..][0..items.len], items);
+    }
+
+    pub fn print(self: *GrowableString, gpa: Allocator, comptime fmt: []const u8, args: anytype) error{OutOfMemory}!void {
+        try self.ensureUnusedCapacity(gpa, fmt.len);
+        var aw: std.Io.Writer.Allocating = .fromArrayList(gpa, self);
+        defer self.* = aw.toArrayList();
+        return aw.writer.print(fmt, args) catch |err| switch (err) {
+            error.WriteFailed => return error.OutOfMemory,
+        };
+    }
+
+    pub fn printAssumeCapacity(self: *GrowableString, comptime fmt: []const u8, args: anytype) void {
+        var w: std.Io.Writer = .fixed(self.unusedCapacitySlice());
+        w.print(fmt, args) catch unreachable;
+        self.items.len += w.end;
+    }
+
+    /// Append a value to the list `n` times.
+    /// Allocates more memory as necessary.
+    /// Invalidates element pointers if additional memory is needed.
+    /// The function is inline so that a comptime-known `value` parameter will
+    /// have a more optimal memset codegen in case it has a repeated byte pattern.
+    pub inline fn appendNTimes(self: *GrowableString, gpa: Allocator, value: u8, n: usize) Allocator.Error!void {
+        const old_len = self.items.len;
+        try self.resize(gpa, try addOrOom(old_len, n));
+        @memset(self.items[old_len..self.items.len], value);
+    }
+
+    /// Append a value to the list `n` times.
+    ///
+    /// Never invalidates element pointers.
+    ///
+    /// The function is inline so that a comptime-known `value` parameter will
+    /// have better memset codegen in case it has a repeated byte pattern.
+    ///
+    /// Asserts that the list can hold the additional items.
+    pub inline fn appendNTimesAssumeCapacity(self: *GrowableString, value: u8, n: usize) void {
+        const new_len = self.items.len + n;
+        std.debug.assert(new_len <= self.capacity);
+        @memset(self.items.ptr[self.items.len..new_len], value);
+        self.items.len = new_len;
+    }
+
+    /// Adjust the list length to `new_len`.
+    /// Additional elements contain the value `undefined`.
+    /// Invalidates element pointers if additional memory is needed.
+    pub fn resize(self: *GrowableString, gpa: Allocator, new_len: usize) Allocator.Error!void {
+        try self.ensureTotalCapacity(gpa, new_len);
+        self.items.len = new_len;
+    }
+
+    /// Reduce allocated capacity to `new_len`.
+    /// May invalidate element pointers.
+    /// Asserts that the new length is less than or equal to the previous length.
+    pub fn shrinkAndFree(self: *GrowableString, gpa: Allocator, new_len: usize) void {
+        self.shrinkAndFreePrecise(gpa, new_len) catch |e| switch (e) {
+            error.OutOfMemory => {
+                // No problem, capacity is still correct then.
+                self.items.len = new_len;
+                return;
+            },
+        };
+    }
+
+    /// Reduce allocated capacity to `new_len`.
+    /// May invalidate element pointers.
+    /// Asserts that the new length is less than or equal to the previous length.
+    /// If succeds capacity is guaranteed to be equal to the length.
+    pub fn shrinkAndFreePrecise(self: *GrowableString, gpa: Allocator, new_len: usize) Allocator.Error!void {
+        std.debug.assert(new_len <= self.items.len);
+
+        if (self.is_readonly) {
+            const new_memory = try gpa.alignedAlloc(u8, alignment, new_len);
+
+            @memcpy(new_memory, self.items[0..new_len]);
+            self.items = new_memory;
+            self.capacity = new_memory.len;
+            self.is_readonly = false;
+        }
+
+        const old_memory = self.allocatedSlice();
+        if (gpa.remap(old_memory, new_len)) |new_items| {
+            self.capacity = new_items.len;
+            self.items = new_items;
+            return;
+        }
+
+        const new_memory = try gpa.alignedAlloc(u8, alignment, new_len);
+
+        @memcpy(new_memory, self.items[0..new_len]);
+        gpa.free(old_memory);
+        self.items = new_memory;
+        self.capacity = new_memory.len;
+    }
+
+    /// Shrinks capacity to match length.
+    /// May invalidate element pointers.
+    /// If succeds it is safe to call toOwnedSliceAssert().
+    pub fn shrinkToLen(self: *GrowableString, gpa: Allocator) Allocator.Error!void {
+        try self.shrinkAndFreePrecise(gpa, self.items.len);
+    }
+
+    /// Shrinks or expands capacity to match length + 1.
+    /// May invalidate element pointers.
+    /// If succeds it is safe to call toOwnedSliceSentinelAssert().
+    pub fn shrinkToLenSentinel(self: *GrowableString, gpa: Allocator) Allocator.Error!void {
+        std.debug.assert(self.items.len <= self.capacity);
+        const required_len = self.items.len + 1;
+        switch (std.math.order(required_len, self.capacity)) {
+            .eq => return,
+            .gt => {
+                try self.ensureTotalCapacityPrecise(gpa, required_len);
+            },
+            .lt => {
+                self.items.len += 1;
+                defer self.items.len -= 1;
+                try self.shrinkToLen(gpa);
+            },
+        }
+    }
+
+    /// Reduce length to `new_len`.
+    /// Invalidates pointers to elements `items[new_len..]`.
+    /// Keeps capacity the same.
+    /// Asserts that the new length is less than or equal to the previous length.
+    pub fn shrinkRetainingCapacity(self: *GrowableString, new_len: usize) void {
+        std.debug.assert(new_len <= self.items.len);
+        @memset(self.items[new_len..], undefined);
+        self.items.len = new_len;
+    }
+
+    /// Reduce length to 0.
+    /// Invalidates all element pointers.
+    pub fn clearRetainingCapacity(self: *GrowableString) void {
+        @memset(self.items, undefined);
+        self.items.len = 0;
+    }
+
+    /// Invalidates all element pointers.
+    pub fn clearAndFree(self: *GrowableString, gpa: Allocator) void {
+        if (self.is_readonly) gpa.free(self.allocatedSlice());
+        self.items.len = 0;
+        self.capacity = 0;
+    }
+
+    /// Modify the array so that it can hold at least `new_capacity` items.
+    /// Implements super-linear growth to achieve amortized O(1) append operations.
+    /// Invalidates element pointers if additional memory is needed.
+    pub fn ensureTotalCapacity(self: *GrowableString, gpa: Allocator, new_capacity: usize) Allocator.Error!void {
+        if (self.capacity >= new_capacity) return;
+        return self.ensureTotalCapacityPrecise(gpa, growCapacity(new_capacity));
+    }
+
+    /// If the current capacity is less than `new_capacity`, this function will
+    /// modify the array so that it can hold exactly `new_capacity` items.
+    /// Invalidates element pointers if additional memory is needed.
+    pub fn ensureTotalCapacityPrecise(self: *GrowableString, gpa: Allocator, new_capacity: usize) Allocator.Error!void {
+        if (self.capacity >= new_capacity) return;
+
+        // Here we avoid copying allocated but unused bytes by
+        // attempting a resize in place, and falling back to allocating
+        // a new buffer and doing our own copy. With a realloc() call,
+        // the allocator implementation would pointlessly copy our
+        // extra capacity.
+        const old_memory = self.allocatedSlice();
+        if (self.is_readonly) {
+            const new_memory = try gpa.alignedAlloc(u8, alignment, new_capacity);
+            @memcpy(new_memory[0..self.items.len], self.items);
+            self.items.ptr = new_memory.ptr;
+            self.capacity = new_memory.len;
+            self.is_readonly = false;
+        } else {
+            if (gpa.remap(old_memory, new_capacity)) |new_memory| {
+                self.items.ptr = new_memory.ptr;
+                self.capacity = new_memory.len;
+            } else {
+                const new_memory = try gpa.alignedAlloc(u8, alignment, new_capacity);
+                @memcpy(new_memory[0..self.items.len], self.items);
+                gpa.free(old_memory);
+                self.items.ptr = new_memory.ptr;
+                self.capacity = new_memory.len;
+            }
+        }
+    }
+
+    /// Modify the array so that it can hold at least `additional_count` **more** items.
+    /// Invalidates element pointers if additional memory is needed.
+    pub fn ensureUnusedCapacity(
+        self: *GrowableString,
+        gpa: Allocator,
+        additional_count: usize,
+    ) Allocator.Error!void {
+        return self.ensureTotalCapacity(gpa, try addOrOom(self.items.len, additional_count));
+    }
+
+    /// Increases the array's length to match the full capacity that is already allocated.
+    /// The new elements have `undefined` values.
+    /// Never invalidates element pointers.
+    pub fn expandToCapacity(self: *GrowableString) void {
+        self.items.len = self.capacity;
+    }
+
+    /// Increase length by 1, returning pointer to the new item.
+    /// The returned element pointer becomes invalid when the list is resized.
+    pub fn addOne(self: *GrowableString, gpa: Allocator) Allocator.Error!*u8 {
+        // This can never overflow because `self.items` can never occupy the whole address space
+        const newlen = self.items.len + 1;
+        try self.ensureTotalCapacity(gpa, newlen);
+        return self.addOneAssumeCapacity();
+    }
+
+    /// Increase length by 1, returning pointer to the new item.
+    ///
+    /// Never invalidates element pointers.
+    ///
+    /// The returned element pointer becomes invalid when the list is resized.
+    ///
+    /// Asserts that the list can hold one additional item.
+    pub fn addOneAssumeCapacity(self: *GrowableString) *u8 {
+        std.debug.assert(self.items.len < self.capacity);
+
+        self.items.len += 1;
+        return &self.items[self.items.len - 1];
+    }
+
+    /// Resize the array, adding `n` new elements, which have `undefined` values.
+    /// The return value is an array pointing to the newly allocated elements.
+    /// The returned pointer becomes invalid when the list is resized.
+    pub fn addManyAsArray(self: *GrowableString, gpa: Allocator, comptime n: usize) Allocator.Error!*[n]u8 {
+        const prev_len = self.items.len;
+        try self.resize(gpa, try addOrOom(self.items.len, n));
+        return self.items[prev_len..][0..n];
+    }
+
+    /// Resize the array, adding `n` new elements, which have `undefined` values.
+    ///
+    /// The return value is an array pointing to the newly allocated elements.
+    ///
+    /// Never invalidates element pointers.
+    ///
+    /// The returned pointer becomes invalid when the list is resized.
+    ///
+    /// Asserts that the list can hold the additional items.
+    pub fn addManyAsArrayAssumeCapacity(self: *GrowableString, comptime n: usize) *[n]u8 {
+        std.debug.assert(self.items.len + n <= self.capacity);
+        const prev_len = self.items.len;
+        self.items.len += n;
+        return self.items[prev_len..][0..n];
+    }
+
+    /// Resize the array, adding `n` new elements, which have `undefined` values.
+    /// The return value is a slice pointing to the newly allocated elements.
+    /// The returned pointer becomes invalid when the list is resized.
+    /// Resizes list if `self.capacity` is not large enough.
+    pub fn addManyAsSlice(self: *GrowableString, gpa: Allocator, n: usize) Allocator.Error![]u8 {
+        const prev_len = self.items.len;
+        try self.resize(gpa, try addOrOom(self.items.len, n));
+        return self.items[prev_len..][0..n];
+    }
+
+    /// Resizes the array, adding `n` new elements, which have `undefined`
+    /// values, returning a slice pointing to the newly allocated elements.
+    ///
+    /// Never invalidates element pointers. The returned pointer becomes
+    /// invalid when the list is resized.
+    ///
+    /// Asserts that the list can hold the additional items.
+    pub fn addManyAsSliceAssumeCapacity(self: *GrowableString, n: usize) []u8 {
+        std.debug.assert(self.items.len + n <= self.capacity);
+        const prev_len = self.items.len;
+        self.items.len += n;
+        return self.items[prev_len..][0..n];
+    }
+
+    /// Remove and return the last element from the list.
+    /// If the list is empty, returns `null`.
+    /// Invalidates pointers to last element.
+    pub fn pop(self: *GrowableString) ?u8 {
+        if (self.items.len == 0) return null;
+        const val = self.items[self.items.len - 1];
+        self.items[self.items.len - 1] = undefined;
+        self.items.len -= 1;
+        return val;
+    }
+
+    /// Returns a slice of all the items plus the extra capacity, whose memory
+    /// contents are `undefined`.
+    pub fn allocatedSlice(self: GrowableString) Slice {
+        return self.items.ptr[0..self.capacity];
+    }
+
+    /// Returns a slice of only the extra capacity after items.
+    /// This can be useful for writing directly into an ArrayList.
+    /// Note that such an operation must be followed up with a direct
+    /// modification of `self.items.len`.
+    pub fn unusedCapacitySlice(self: GrowableString) []u8 {
+        return self.allocatedSlice()[self.items.len..];
+    }
+
+    /// Return the last element from the list.
+    /// Asserts that the list is not empty.
+    pub fn getLast(self: GrowableString) u8 {
+        return self.items[self.items.len - 1];
+    }
+
+    /// Return the last element from the list, or
+    /// return `null` if list is empty.
+    pub fn getLastOrNull(self: GrowableString) ?u8 {
+        if (self.items.len == 0) return null;
+        return self.getLast();
+    }
+
+    /// Called when memory growth is necessary. Returns a capacity larger than
+    /// minimum that grows super-linearly.
+    pub fn growCapacity(minimum: usize) usize {
+        const init_capacity: comptime_int = @max(1, std.atomic.cache_line / @sizeOf(u8));
+        return minimum +| (minimum / 2 + init_capacity);
+    }
+};
+
+pub const Node = struct {
+    pub const String = GrowableString;
 
     string: String,
     total_length: usize,
+    parent: ?*Node = null,
     left: ?*Node = null,
     right: ?*Node = null,
 
     pub inline fn init(node: *Node, left: ?*Node, right: ?*Node) *Node {
+        if (left) |l| l.parent = node;
+        if (right) |r| r.parent = node;
         node.* = .{
             .string = .empty,
             .total_length = (if (left) |l| l.total_length else 0) + if (right) |r| r.total_length else 0,
@@ -41,12 +717,12 @@ pub const Node = struct {
 
     pub inline fn isLeaf(self: *const Node) bool {
         if (builtin.mode == .Debug) {
-            if (self.string.len() == 0)
+            if (self.string.items.len == 0)
                 std.debug.assert(self.left != null or self.right != null)
             else
                 std.debug.assert(self.left == null and self.right == null);
         }
-        return self.string.len() != 0;
+        return self.string.items.len != 0;
     }
 
     pub fn getNonLeafs(self: *Node, scratch: std.mem.Allocator) std.ArrayList(*Node) {
@@ -65,6 +741,474 @@ pub const Node = struct {
                 right.getNonLeafsImpl(list, scratch);
             }
         }
+    }
+
+    fn setLen(self: *Node, old_len: usize, len: usize) void {
+        var current: ?*Node = self;
+        if (old_len > len) {
+            const inc = old_len - len;
+            while (current != null) {
+                current.?.total_length -= inc;
+                current = current.?.parent;
+            }
+        } else {
+            const inc = len - old_len;
+            while (current != null) {
+                current.?.total_length += inc;
+                current = current.?.parent;
+            }
+        }
+    }
+
+    /// Insert `item` at index `i`. Moves `list[i .. list.len]` to higher indices to make room.
+    /// If `i` is equal to the length of the list this operation is equivalent to append.
+    /// This operation is O(N).
+    /// Invalidates element pointers if additional memory is needed.
+    /// Asserts that the index is in bounds or equal to the length.
+    pub inline fn insert(self: *Node, gpa: Allocator, i: usize, item: u8) Allocator.Error!void {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.insert(gpa, i, item);
+    }
+
+    /// Insert `item` at index `i`. Moves `list[i .. list.len]` to higher indices to make room.
+    ///
+    /// If `i` is equal to the length of the list this operation is equivalent to append.
+    ///
+    /// This operation is O(N).
+    ///
+    /// Asserts that the list has capacity for one additional item.
+    ///
+    /// Asserts that the index is in bounds or equal to the length.
+    pub inline fn insertAssumeCapacity(self: *Node, i: usize, item: u8) void {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.insertAssumeCapacity(i, item);
+    }
+
+    /// Add `count` new elements at position `index`, which have
+    /// `undefined` values. Returns a slice pointing to the newly allocated
+    /// elements, which becomes invalid after various `ArrayList`
+    /// operations.
+    /// Invalidates pre-existing pointers to elements at and after `index`.
+    /// Invalidates all pre-existing element pointers if capacity must be
+    /// increased to accommodate the new elements.
+    /// Asserts that the index is in bounds or equal to the length.
+    pub inline fn addManyAt(self: *Node, index: usize, count: usize) Allocator.Error![]u8 {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.addManyAt(index, count);
+    }
+
+    /// Add `count` new elements at position `index`, which have
+    /// `undefined` values. Returns a slice pointing to the newly allocated
+    /// elements, which becomes invalid after various `ArrayList`
+    /// operations.
+    /// Invalidates pre-existing pointers to elements at and after `index`, but
+    /// does not invalidate any before that.
+    /// Asserts that the list has capacity for the additional items.
+    /// Asserts that the index is in bounds or equal to the length.
+    pub inline fn addManyAtAssumeCapacity(self: *Node, index: usize, count: usize) []u8 {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.addManyAtAssumeCapacity(index, count);
+    }
+
+    /// Insert slice `items` at index `i` by moving `list[i .. list.len]` to make room.
+    /// This operation is O(N).
+    /// Invalidates pre-existing pointers to elements at and after `index`.
+    /// Invalidates all pre-existing element pointers if capacity must be
+    /// increased to accommodate the new elements.
+    /// Asserts that the index is in bounds or equal to the length.
+    pub inline fn insertSlice(self: *Node, gpa: Allocator, index: usize, items: []const u8) Allocator.Error!void {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.insertSlice(gpa, index, items);
+    }
+
+    /// Insert slice `items` at index `i` by moving `list[i .. list.len]` to make room.
+    /// This operation is O(N).
+    /// Invalidates pre-existing pointers to elements at and after `index`.
+    /// Asserts that the list has capacity for the additional items.
+    /// Asserts that the index is in bounds or equal to the length.
+    pub inline fn insertSliceAssumeCapacity(self: *Node, index: usize, items: []const u8) void {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.insertSliceAssumeCapacity(index, items);
+    }
+
+    /// Grows or shrinks the list as necessary.
+    /// Invalidates element pointers if additional capacity is allocated.
+    /// Asserts that the range is in bounds.
+    pub inline fn replaceRange(self: *Node, gpa: Allocator, start: usize, len: usize, new_items: []const u8) Allocator.Error!void {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.replaceRange(gpa, start, len, new_items);
+    }
+
+    /// Grows or shrinks the list as necessary.
+    ///
+    /// Never invalidates element pointers.
+    ///
+    /// Asserts the capacity is enough for additional items.
+    pub inline fn replaceRangeAssumeCapacity(self: *Node, start: usize, len: usize, new_items: []const u8) void {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.replaceRangeAssumeCapacity(start, len, new_items);
+    }
+
+    /// Extend the list by 1 element. Allocates more memory as necessary.
+    /// Invalidates element pointers if additional memory is needed.
+    pub inline fn append(self: *Node, gpa: Allocator, item: u8) Allocator.Error!void {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.append(gpa, item);
+    }
+
+    /// Extend the list by 1 element.
+    ///
+    /// Never invalidates element pointers.
+    ///
+    /// Asserts that the list can hold one additional item.
+    pub inline fn appendAssumeCapacity(self: *Node, item: u8) void {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.append(item);
+    }
+
+    /// Remove the element at index `i` from the list and return its value.
+    /// Invalidates pointers to the last element.
+    /// This operation is O(N).
+    /// Asserts that the index is in bounds.
+    pub inline fn orderedRemove(self: *Node, i: usize) u8 {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.orderedRemove(i);
+    }
+
+    /// Remove the elements indexed by `sorted_indexes`. The indexes to be
+    /// removed correspond to the array list before deletion.
+    ///
+    /// Asserts:
+    /// * Each index to be removed is in bounds.
+    /// * The indexes to be removed are sorted ascending.
+    ///
+    /// Duplicates in `sorted_indexes` are allowed.
+    ///
+    /// This operation is O(N).
+    ///
+    /// Invalidates element pointers beyond the first deleted index.
+    pub inline fn orderedRemoveMany(self: *Node, sorted_indexes: []const usize) void {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.orderedRemoveMany(sorted_indexes);
+    }
+
+    /// Removes the element at the specified index and returns it.
+    /// The empty slot is filled from the end of the list.
+    /// Invalidates pointers to last element.
+    /// This operation is O(1).
+    /// Asserts that the index is in bounds.
+    pub inline fn swapRemove(self: *Node, i: usize) u8 {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.swapRemove(i);
+    }
+
+    /// Append the slice of items to the list. Allocates more
+    /// memory as necessary.
+    /// Invalidates element pointers if additional memory is needed.
+    pub inline fn appendSlice(self: *Node, gpa: Allocator, items: []const u8) Allocator.Error!void {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.appendSlice(gpa, items);
+    }
+
+    /// Append the slice of items to the list.
+    ///
+    /// Asserts that the list can hold the additional items.
+    pub inline fn appendSliceAssumeCapacity(self: *Node, items: []const u8) void {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.appendSliceAssumeCapacity(items);
+    }
+
+    pub inline fn print(self: *Node, gpa: Allocator, comptime fmt: []const u8, args: anytype) error{OutOfMemory}!void {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.print(gpa, fmt, args);
+    }
+
+    pub inline fn printAssumeCapacity(self: *Node, comptime fmt: []const u8, args: anytype) void {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.printAssumeCapacity(fmt, args);
+    }
+
+    /// Append a value to the list `n` times.
+    /// Allocates more memory as necessary.
+    /// Invalidates element pointers if additional memory is needed.
+    /// The function is inline so that a comptime-known `value` parameter will
+    /// have a more optimal memset codegen in case it has a repeated byte pattern.
+    pub inline fn appendNTimes(self: *Node, gpa: Allocator, value: u8, n: usize) Allocator.Error!void {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.appendNTimes(gpa, value, n);
+    }
+
+    /// Append a value to the list `n` times.
+    ///
+    /// Never invalidates element pointers.
+    ///
+    /// The function is inline so that a comptime-known `value` parameter will
+    /// have better memset codegen in case it has a repeated byte pattern.
+    ///
+    /// Asserts that the list can hold the additional items.
+    pub inline fn appendNTimesAssumeCapacity(self: *Node, value: u8, n: usize) void {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.appendNTimesAssumeCapacity(value, n);
+    }
+
+    /// Adjust the list length to `new_len`.
+    /// Additional elements contain the value `undefined`.
+    /// Invalidates element pointers if additional memory is needed.
+    pub inline fn resize(self: *Node, gpa: Allocator, new_len: usize) Allocator.Error!void {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.resize(gpa, new_len);
+    }
+
+    /// Reduce allocated capacity to `new_len`.
+    /// May invalidate element pointers.
+    /// Asserts that the new length is less than or equal to the previous length.
+    pub inline fn shrinkAndFree(self: *Node, gpa: Allocator, new_len: usize) void {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.shrinkAndFree(gpa, new_len);
+    }
+
+    /// Reduce allocated capacity to `new_len`.
+    /// May invalidate element pointers.
+    /// Asserts that the new length is less than or equal to the previous length.
+    /// If succeds capacity is guaranteed to be equal to the length.
+    pub inline fn shrinkAndFreePrecise(self: *Node, gpa: Allocator, new_len: usize) Allocator.Error!void {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.shrinkAndFreePrecise(gpa, new_len);
+    }
+
+    /// Shrinks capacity to match length.
+    /// May invalidate element pointers.
+    /// If succeds it is safe to call toOwnedSliceAssert().
+    pub inline fn shrinkToLen(self: *Node, gpa: Allocator) Allocator.Error!void {
+        std.debug.assert(self.isLeaf());
+        return self.string.shrinkToLen(gpa);
+    }
+
+    /// Shrinks or expands capacity to match length + 1.
+    /// May invalidate element pointers.
+    /// If succeds it is safe to call toOwnedSliceSentinelAssert().
+    pub inline fn shrinkToLenSentinel(self: *Node, gpa: Allocator) Allocator.Error!void {
+        std.debug.assert(self.isLeaf());
+        return self.string.shrinkToLenSentinel(gpa);
+    }
+
+    /// Reduce length to `new_len`.
+    /// Invalidates pointers to elements `items[new_len..]`.
+    /// Keeps capacity the same.
+    /// Asserts that the new length is less than or equal to the previous length.
+    pub inline fn shrinkRetainingCapacity(self: *Node, new_len: usize) void {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.shrinkRetainingCapacity(new_len);
+    }
+
+    /// Reduce length to 0.
+    /// Invalidates all element pointers.
+    pub inline fn clearRetainingCapacity(self: *Node) void {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.clearRetainingCapacity();
+    }
+
+    /// Invalidates all element pointers.
+    pub inline fn clearAndFree(self: *Node, gpa: Allocator) void {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.clearAndFree(gpa);
+    }
+
+    /// Modify the array so that it can hold at least `new_capacity` items.
+    /// Implements super-linear growth to achieve amortized O(1) append operations.
+    /// Invalidates element pointers if additional memory is needed.
+    pub inline fn ensureTotalCapacity(self: *Node, gpa: Allocator, new_capacity: usize) Allocator.Error!void {
+        std.debug.assert(self.isLeaf());
+        return self.string.ensureTotalCapacity(gpa, new_capacity);
+    }
+
+    /// If the current capacity is less than `new_capacity`, this function will
+    /// modify the array so that it can hold exactly `new_capacity` items.
+    /// Invalidates element pointers if additional memory is needed.
+    pub inline fn ensureTotalCapacityPrecise(self: *Node, gpa: Allocator, new_capacity: usize) Allocator.Error!void {
+        std.debug.assert(self.isLeaf());
+        return self.string.ensureTotalCapacityPrecise(gpa, new_capacity);
+    }
+
+    /// Modify the array so that it can hold at least `additional_count` **more** items.
+    /// Invalidates element pointers if additional memory is needed.
+    pub inline fn ensureUnusedCapacity(self: *Node, gpa: Allocator, additional_count: usize) Allocator.Error!void {
+        return self.string.ensureUnusedCapacity(gpa, additional_count);
+    }
+
+    /// Increases the array's length to match the full capacity that is already allocated.
+    /// The new elements have `undefined` values.
+    /// Never invalidates element pointers.
+    pub inline fn expandToCapacity(self: *Node) void {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.expandToCapacity();
+    }
+
+    /// Increase length by 1, returning pointer to the new item.
+    /// The returned element pointer becomes invalid when the list is resized.
+    pub inline fn addOne(self: *Node, gpa: Allocator) Allocator.Error!*u8 {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.addOne(gpa);
+    }
+
+    /// Increase length by 1, returning pointer to the new item.
+    ///
+    /// Never invalidates element pointers.
+    ///
+    /// The returned element pointer becomes invalid when the list is resized.
+    ///
+    /// Asserts that the list can hold one additional item.
+    pub inline fn addOneAssumeCapacity(self: *Node) *u8 {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.addOneAssumeCapacity();
+    }
+
+    /// Resize the array, adding `n` new elements, which have `undefined` values.
+    /// The return value is an array pointing to the newly allocated elements.
+    /// The returned pointer becomes invalid when the list is resized.
+    pub inline fn addManyAsArray(self: *Node, gpa: Allocator, comptime n: usize) Allocator.Error!*[n]u8 {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.addManyAsArray(gpa, n);
+    }
+
+    /// Resize the array, adding `n` new elements, which have `undefined` values.
+    ///
+    /// The return value is an array pointing to the newly allocated elements.
+    ///
+    /// Never invalidates element pointers.
+    ///
+    /// The returned pointer becomes invalid when the list is resized.
+    ///
+    /// Asserts that the list can hold the additional items.
+    pub inline fn addManyAsArrayAssumeCapacity(self: *Node, comptime n: usize) *[n]u8 {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.addManyAsArrayAssumeCapacity(n);
+    }
+
+    /// Resize the array, adding `n` new elements, which have `undefined` values.
+    /// The return value is a slice pointing to the newly allocated elements.
+    /// The returned pointer becomes invalid when the list is resized.
+    /// Resizes list if `self.capacity` is not large enough.
+    pub inline fn addManyAsSlice(self: *Node, gpa: Allocator, n: usize) Allocator.Error![]u8 {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.addManyAsSlice(gpa, n);
+    }
+
+    /// Resizes the array, adding `n` new elements, which have `undefined`
+    /// values, returning a slice pointing to the newly allocated elements.
+    ///
+    /// Never invalidates element pointers. The returned pointer becomes
+    /// invalid when the list is resized.
+    ///
+    /// Asserts that the list can hold the additional items.
+    pub inline fn addManyAsSliceAssumeCapacity(self: *Node, n: usize) []u8 {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.addManyAsSliceAssumeCapacity(n);
+    }
+
+    /// Remove and return the last element from the list.
+    /// If the list is empty, returns `null`.
+    /// Invalidates pointers to last element.
+    pub inline fn pop(self: *Node) ?u8 {
+        std.debug.assert(self.isLeaf());
+        const old_len = self.string.items.len;
+        defer self.setLen(old_len, self.string.items.len);
+        return self.string.pop();
+    }
+
+    /// Returns a slice of all the items plus the extra capacity, whose memory
+    /// contents are `undefined`.
+    pub inline fn allocatedSlice(self: *Node) []u8 {
+        std.debug.assert(self.isLeaf());
+        return self.string.allocatedSlice();
+    }
+
+    /// Returns a slice of only the extra capacity after items.
+    /// This can be useful for writing directly into an ArrayList.
+    /// Note that such an operation must be followed up with a direct
+    /// modification of `self.items.len`.
+    pub inline fn unusedCapacitySlice(self: *Node) []u8 {
+        std.debug.assert(self.isLeaf());
+        return self.string.unusedCapacitySlice();
+    }
+
+    /// Return the last element from the list.
+    /// Asserts that the list is not empty.
+    pub inline fn getLast(self: *Node) u8 {
+        std.debug.assert(self.isLeaf());
+        return self.items[self.items.len - 1];
+    }
+
+    /// Return the last element from the list, or
+    /// return `null` if list is empty.
+    pub inline fn getLastOrNull(self: *Node) ?u8 {
+        std.debug.assert(self.isLeaf());
+        if (self.items.len == 0) return null;
+        return self.getLast();
     }
 };
 
@@ -95,7 +1239,7 @@ pub fn loadEmpty(self: *Self) void {
 pub fn loadString(self: *Self, string: []const u8) void {
     const node = self.node_pool.create(self.allocator) catch @panic("OOM");
     node.* = .{
-        .string = .{ .read_only = string },
+        .string = .initReadonly(string),
         .total_length = string.len,
     };
     self.root = node;
@@ -110,10 +1254,7 @@ pub fn createNode(self: *Self, left: ?*Node, right: ?*Node) *Node {
 
 pub fn createLeafNode(self: *Self, string: Node.String) *Node {
     const node = self.node_pool.create(self.allocator) catch @panic("OOM");
-    node.* = .{
-        .string = string,
-        .total_length = string.len(),
-    };
+    node.* = .{ .string = string, .total_length = string.items.len };
     return node;
 }
 
@@ -171,24 +1312,14 @@ pub fn rebalanceImpl(self: *Self, reuse_non_leafs: *[]const *Node, nodes: []cons
 
 pub fn split(self: *Self, node: *Node, index: usize) struct { *Node, *Node } {
     if (node.isLeaf()) {
-        switch (node.string) {
-            .allocated => |list| {
-                // We reuse the the current node's allocated for the lhs, and create a new allocated for rhs
-                var allocated_list = std.ArrayList(u8).empty;
-                allocated_list.appendSlice(self.allocator, list.items[index..]) catch @panic("OOM");
+        // We reuse the the current node's allocated for the lhs, and create a new allocated for rhs
+        var allocated_list = GrowableString.empty;
+        allocated_list.appendSlice(self.allocator, node.string.items[index..]) catch @panic("OOM");
 
-                const new_right = self.createLeafNode(.{ .allocated = allocated_list });
-                node.string.allocated.items.len = index;
-                node.total_length = index;
-                return .{ node, new_right };
-            },
-            .read_only => |slice| {
-                const new_right = self.createLeafNode(.{ .read_only = slice[index..] });
-                node.string = .{ .read_only = slice[0..index] };
-                node.total_length = index;
-                return .{ node, new_right };
-            },
-        }
+        const new_right = self.createLeafNode(allocated_list);
+        node.string.items.len = index;
+        node.total_length = index;
+        return .{ node, new_right };
     }
 
     const midpoint = if (node.left) |left| left.total_length else 0;
@@ -212,14 +1343,11 @@ pub fn split(self: *Self, node: *Node, index: usize) struct { *Node, *Node } {
 /// String is copied, and an allocated node is inserted.
 ///
 /// The root node must not be empty.
-pub fn insertString(self: *Self, index: usize, string: []const u8) void {
+pub fn insertString(self: *Self, index: usize, string: []const u8) *Node {
     std.debug.assert(self.root != null);
     const current = self.root.?;
 
-    var allocated_list = std.ArrayList(u8).empty;
-    allocated_list.appendSlice(self.allocator, string) catch @panic("OOM");
-
-    const allocated_string = Node.String{ .allocated = allocated_list };
+    const allocated_string = Node.String.initReadonly(string);
 
     defer self.len += string.len;
     if (index == 0) {
@@ -229,21 +1357,24 @@ pub fn insertString(self: *Self, index: usize, string: []const u8) void {
     }
 
     var lhs, var rhs = self.split(current, index);
+    const leaf_node = self.createLeafNode(allocated_string);
     if (self.balance_state % 2 == 0) {
-        lhs = self.createNode(lhs, self.createLeafNode(allocated_string));
+        lhs = self.createNode(lhs, leaf_node);
     } else {
-        rhs = self.createNode(self.createLeafNode(allocated_string), rhs);
+        rhs = self.createNode(leaf_node, rhs);
     }
     self.balance_state += 1;
     self.root = self.createNode(lhs, rhs);
+
+    return leaf_node;
 }
 
-fn prependString(self: *Self, string: Node.String) void {
+fn prependString(self: *Self, string: Node.String) *Node {
     var current = self.root;
     var parent: ?*Node = null;
     while (current != null and !current.?.isLeaf()) {
         parent = current;
-        current.?.total_length += string.len();
+        current.?.total_length += string.items.len;
         current = current.?.left;
     }
 
@@ -260,9 +1391,11 @@ fn prependString(self: *Self, string: Node.String) void {
         const new_parent = self.createNode(new_left, current.?);
         self.root = new_parent;
     }
+
+    return new_left;
 }
 
-fn appendString(self: *Self, string: Node.String) void {
+fn appendString(self: *Self, string: Node.String) *Node {
     var current = self.root;
     var parent: ?*Node = null;
     while (current != null and !current.?.isLeaf()) {
@@ -283,6 +1416,8 @@ fn appendString(self: *Self, string: Node.String) void {
         const new_parent = self.createNode(current.?, new_right);
         self.root = new_parent;
     }
+
+    return new_right;
 }
 
 pub fn dumpNodeToFile(self: *Self, node: *Node, filename: []const u8) !void {
@@ -309,7 +1444,7 @@ pub fn dumpGraph(self: *Self, writer: *std.Io.Writer) !void {
 pub fn dumpGraphImpl(self: *Self, node: *Node, id: usize, writer: *std.Io.Writer) !usize {
     const my_id = id;
     if (node.isLeaf()) {
-        try writer.print("node{} [label=\"{}\\n{s}\"];\n", .{ my_id, node.total_length, node.string.items() });
+        try writer.print("node{} [label=\"{}\\n{s}\"];\n", .{ my_id, node.total_length, node.string.items });
 
         return id + 1;
     } else {
@@ -341,7 +1476,7 @@ pub const Iterator = struct {
     pub fn next(self: *Iterator) ?u32 {
         const current = self.stack.getLastOrNull() orelse return null;
 
-        if (self.index >= current.string.len()) {
+        if (self.index >= current.string.items.len) {
             var left = self.stack.pop() orelse return null;
 
             if (self.stack.pop()) |parent| {
@@ -358,14 +1493,14 @@ pub const Iterator = struct {
                 }
             } else return null;
 
-            const length = std.unicode.utf8ByteSequenceLength(left.string.items()[0]) catch @panic("invalid utf8");
-            const codepoint = std.unicode.utf8Decode(left.string.items()[0..length]) catch @panic("invalid utf8");
+            const length = std.unicode.utf8ByteSequenceLength(left.string.items[0]) catch @panic("invalid utf8");
+            const codepoint = std.unicode.utf8Decode(left.string.items[0..length]) catch @panic("invalid utf8");
             defer self.index = length;
 
             return @as(u32, codepoint);
         } else {
-            const length = std.unicode.utf8ByteSequenceLength(current.string.items()[self.index]) catch @panic("invlaid utf8");
-            const codepoint = std.unicode.utf8Decode(current.string.items()[self.index .. self.index + length]) catch @panic("invalid utf8");
+            const length = std.unicode.utf8ByteSequenceLength(current.string.items[self.index]) catch @panic("invlaid utf8");
+            const codepoint = std.unicode.utf8Decode(current.string.items[self.index .. self.index + length]) catch @panic("invalid utf8");
             defer self.index += length;
 
             return @as(u32, codepoint);

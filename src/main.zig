@@ -82,8 +82,9 @@ pub fn main(init: std.process.Init) !void {
 
     var rope = ed.Rope.init(arena.allocator());
     rope.loadString("what the hell are you doing");
-    rope.insertString(7, "1234");
-    rope.insertString(18, "bruhv");
+    _ = rope.insertString(7, "1234");
+    const bruhv_inser_point = rope.insertString(18, "bruhv");
+    try bruhv_inser_point.appendSlice(arena.allocator(), "umm ok");
     // rope.insertString(13, "im tthirten");
 
     // rope.rebalance(scratch.allocator());
