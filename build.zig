@@ -20,6 +20,19 @@ pub fn build(b: *std.Build) void {
     win32.linkSystemLibrary("dwrite", .{});
     win32.linkSystemLibrary("windowscodecs", .{});
 
+    const generate_keymap = b.addExecutable(.{
+        .name = "generate_keymap",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/generate_keymap.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const run_generate_keymap = b.addRunArtifact(generate_keymap);
+
+    const generated_keymap = run_generate_keymap.addOutputFileArg("keymap.zig");
+
     const exe = b.addExecutable(.{
         .name = "editor",
         .root_module = b.createModule(.{
@@ -29,6 +42,22 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "editor", .module = mod },
                 .{ .name = "win32", .module = win32.createModule() },
+                .{
+                    .name = "keymap",
+                    .module = b.createModule(.{
+                        .root_source_file = generated_keymap,
+                        .target = target,
+                        .optimize = optimize,
+                        .imports = &.{.{
+                            .name = "commands",
+                            .module = b.createModule(.{
+                                .root_source_file = b.path("src/commands.zig"),
+                                .target = target,
+                                .optimize = optimize,
+                            }),
+                        }},
+                    }),
+                },
             },
         }),
     });

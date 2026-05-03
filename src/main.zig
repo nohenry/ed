@@ -20,8 +20,51 @@ fn window_proc(hwnd: win32.HWND, message: win32.UINT, wparam: win32.WPARAM, lpar
             _ = win32.DestroyWindow(hwnd);
             return 0;
         },
+        win32.WM_SIZE => {
+            const new_height: u32 = @as(u32, @intCast(lparam >> 16));
+            const new_width: u32 = @as(u32, @intCast(lparam & 0xFFFF));
+            application.?.resize(new_width, new_height);
+        },
+        win32.WM_SIZING => {
+            // const rect: *const win32.RECT = @ptrFromInt(@as(usize, @intCast(lparam)));
+
+            var rect: win32.RECT = undefined;
+            _ = win32.GetClientRect(hwnd, &rect);
+            const new_width: u32 = @intCast(rect.right - rect.left);
+            const new_height: u32 = @intCast(rect.bottom - rect.top);
+
+            application.?.resize(new_width, new_height);
+        },
+        win32.WM_KEYDOWN => {
+            const event: ?ed.Event = switch (wparam) {
+                win32.VK_ESCAPE => .{
+                    .key_down = .{
+                        .key = .escape,
+                        .char = 0,
+                    },
+                },
+                else => blk: {
+                    var keystate: [256]u8 = undefined;
+                    _ = win32.GetKeyboardState(&keystate[0]);
+
+                    const scancode = (lparam >> 16) & 0xFF;
+                    var char: u16 = 0;
+                    const conversion_result = win32.ToAscii(@truncate(wparam), @intCast(scancode), &keystate, &char, 0);
+
+                    if (conversion_result > 0) {
+                        break :blk .{
+                            .key_down = .{
+                                .key = .char,
+                                .char = char,
+                            },
+                        };
+                    } else break :blk null;
+                },
+            };
+
+            if (event) |e| application.?.handleEvent(e);
+        },
         else => {},
-        // win32.WM_KEYDOWN
     }
     return win32.DefWindowProcA(hwnd, message, wparam, lparam);
 }
@@ -29,8 +72,13 @@ fn window_proc(hwnd: win32.HWND, message: win32.UINT, wparam: win32.WPARAM, lpar
 pub const Application = struct {
     hwnd: win32.HWND = null,
     keep_running: bool = true,
+    renderer: directx.Renderer = undefined,
+    allocator: std.mem.Allocator = undefined,
 
-    pub fn initPinned(self: *Application) void {
+    editor: ?*ed.Editor = null,
+
+    pub fn initPinned(self: *Application, io: std.Io, allocator: std.mem.Allocator) void {
+        self.allocator = allocator;
         const hinstance = win32.GetModuleHandleA(null);
         const class_name = "my_cool_editor_class_name";
         const window_class = win32.WNDCLASSEXA{
@@ -44,18 +92,63 @@ pub const Application = struct {
         _ = win32.RegisterClassExA(&window_class);
         _ = win32.SetProcessDPIAware();
 
-        const hwnd = win32.CreateWindowExA(0, class_name, "MyEditor", win32.WS_OVERLAPPEDWINDOW, win32.CW_USEDEFAULT, win32.CW_USEDEFAULT, 1024, 1000, null, null, hinstance, null);
+        const hwnd = win32.CreateWindowExA(
+            0,
+            class_name,
+            "MyEditor",
+            win32.WS_OVERLAPPEDWINDOW,
+            win32.CW_USEDEFAULT,
+            win32.CW_USEDEFAULT,
+            1024,
+            1000,
+            null,
+            null,
+            hinstance,
+            null,
+        );
+        const renderer = directx.Renderer.new(hwnd, .{});
+        self.renderer = renderer;
+        self.renderer.resize_if_needed(1024, 1000);
+        _ = win32.SetWindowLongPtrA(hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
+        self.createEditor(io);
+        self.draw();
         _ = win32.ShowWindow(hwnd, win32.SW_SHOW);
         self.hwnd = hwnd;
+    }
 
-        _ = win32.SetWindowLongPtrA(hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
+    pub fn createEditor(self: *Application, io: std.Io) void {
+        self.editor = self.allocator.create(ed.Editor) catch @panic("OOM");
+        self.editor.?.* = .init(io, self.allocator);
+        self.editor.?.openDocument("build.zig");
+    }
 
-        var renderer = directx.Renderer.new(hwnd, .{});
-        renderer.resize_if_needed(1024, 1000);
-        renderer.start_glyph_placement();
-        renderer.place_glyph(10, 10, &.{'A'}, .red, .green, .red, .none);
-        renderer.end_glyph_placement();
-        renderer.draw();
+    pub fn resize(self: *Application, width: u32, height: u32) void {
+        self.renderer.resize_if_needed(width, height);
+        self.draw();
+    }
+
+    pub fn handleEvent(self: *Application, event: ed.Event) void {
+        if (self.editor) |editr| {
+            editr.handleEvent(event);
+        }
+        self.draw();
+    }
+
+    pub fn draw(self: *Application) void {
+        self.renderer.start_glyph_placement();
+
+        const area = ed.Rect{
+            .left = 0,
+            .top = 0,
+            .right = self.renderer.cell_count_x,
+            .bottom = self.renderer.cell_count_y,
+        };
+        if (self.editor) |editr| {
+            editr.render(area, &self.renderer);
+        }
+
+        self.renderer.end_glyph_placement();
+        self.renderer.draw();
     }
 
     pub fn run(self: *Application) void {
@@ -73,7 +166,7 @@ pub const Application = struct {
     }
 };
 
-pub fn main(init: std.process.Init) !void {
+pub fn main2(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
 
@@ -91,7 +184,6 @@ pub fn main(init: std.process.Init) !void {
     // rope.insertString(0, "foobar");
     // rope.insertString(rope.len, "fricku");
 
-    std.debug.print("ffooba\n", .{});
     var i = rope.iter(std.heap.page_allocator);
     while (i.next()) |f| {
         std.debug.print("char: {u}\n", .{@as(u21, @truncate(f))});
@@ -107,11 +199,9 @@ pub fn main(init: std.process.Init) !void {
     file.close(init.io);
 }
 
-pub fn main2(init: std.process.Init) !void {
-    _ = init;
-
+pub fn main(init: std.process.Init) !void {
     var application: Application = .{};
-    application.initPinned();
+    application.initPinned(init.io, init.gpa);
 
     application.run();
 }

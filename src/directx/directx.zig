@@ -1,17 +1,17 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const win32 = @import("win32");
+const Color = @import("../ed.zig").Color;
+const Config = @import("../ed.zig").Config;
+const CursorKind = @import("../ed.zig").CursorKind;
+const Style = @import("../ed.zig").Style;
+const UnderlineStyle = @import("../ed.zig").UnderlineStyle;
 const d3d = win32;
 const d2d = win32;
 const dxgi = win32;
 const dwrite = win32;
 
 const compute_shader_source = @embedFile("shader.hlsl");
-
-pub const Config = struct {
-    gui_font_family: []const u8 = "Consolas",
-    gui_font_size: u32 = 16,
-};
 
 pub const GlyphCache = struct {
     pub fn new_direct_codepoint_table(tile_count_x: u32) DirectCodepointTable {
@@ -44,40 +44,11 @@ pub const GpuIndex = extern struct {
 pub const CELL_WIDTH = 40;
 pub const CELL_HEIGHT = 100;
 
-pub const CursorKind = enum {};
-pub const Style = struct {};
-pub const UnderlineStyle = enum(u32) {
-    none = 0,
-    line = 1,
-    curl = 2,
-    dotted = 3,
-    dashed = 4,
-    double_line = 5,
-};
-
 pub const DIRECT_CODEPOINT_MIN: u32 = 32;
 pub const DIRECT_CODEPOINT_MAX: u32 = 126;
 pub const DIRECT_CODEPOINT_COUNT: u32 = DIRECT_CODEPOINT_MAX - DIRECT_CODEPOINT_MIN + 1;
 
 pub const DirectCodepointTable = [DIRECT_CODEPOINT_COUNT]GpuIndex;
-
-pub const Color = extern struct {
-    r: u8,
-    g: u8,
-    b: u8,
-    a: u8,
-
-    pub const red = Color.init(255, 0, 0);
-    pub const green = Color.init(0, 255, 0);
-
-    pub fn init(r: u8, g: u8, b: u8) Color {
-        return .{ .r = r, .g = g, .b = b, .a = 255 };
-    }
-
-    pub fn toPacked(self: Color) u32 {
-        return @bitCast(self);
-    }
-};
 
 pub inline fn set_debug_name(object: anytype, name: []const u8) void {
     _ = object.lpVtbl.*.SetPrivateData.?(
@@ -615,40 +586,25 @@ pub const Renderer = struct {
     }
 
     pub fn place_cursor(self: *@This(), x: u32, y: u32, kind: CursorKind) void {
-        // const mapped = self
-        //     .parameter_buffer
-        //     .map_one::<ShaderParameters>(self.d3d_context);
-        // mapped.cursor_x = x;
-        // mapped.cursor_y = y;
-        // mapped.cursor_kind = match kind {
-        //     CursorKind::Block => 0,
-        //     CursorKind::Bar => 1,
-        //     CursorKind::Underline => 2,
-        //     CursorKind::Hidden => 3,
-        // };
-        // self.parameter_buffer.unmap(self.d3d_context);
+        const cells = self.cell_buffer_mapped.?;
 
-        const cells = self
-            .cell_buffer_mapped
-            .expect("Call start_glyph_placement before this");
+        const cell = &cells[@as(usize, y) * @as(usize, self.cell_count_x) + @as(usize, x)];
 
-        const cell = cells[@as(usize, y) * @as(usize, self.cell_count_x) + @as(usize, x)];
-
-        cell.curosr_kind = switch (kind) {
-            .Hidden => 0,
-            .Block => 1,
-            .Bar => 2,
-            .Underline => 3,
+        cell.cursor_kind = switch (kind) {
+            .hidden => 0,
+            .block => 1,
+            .bar => 2,
+            .underline => 3,
         };
     }
 
-    pub fn set_cursor_style(self: *@This(), style: Style) void {
+    pub fn set_cursor_style(self: *@This(), fg: Color, bg: Color) void {
         {
             const mapped = self
                 .parameter_buffer
                 .map_one(self.d3d_context, ShaderParameters);
-            mapped.cursor_foreground = style.fg.toPacked();
-            mapped.cursor_background = style.bg.toPacked();
+            mapped.cursor_foreground = fg.toPacked();
+            mapped.cursor_background = bg.toPacked();
             // mapped.cursor_foreground = color_to_packed_u32(Color::Cyan);
             // mapped.cursor_background = color_to_packed_u32(Color::Cyan);
             self.parameter_buffer.unmap(self.d3d_context);
@@ -672,10 +628,10 @@ pub const Renderer = struct {
         background: Color,
         underline_color: Color,
         underline_style: UnderlineStyle,
+        cursor_kind: CursorKind,
     ) void {
         const cells = self
-            .cell_buffer_mapped
-            orelse @panic("Call start_glyph_placement before this");
+            .cell_buffer_mapped orelse @panic("Call start_glyph_placement before this");
 
         if (string[0] >= DIRECT_CODEPOINT_MIN and string[0] <= DIRECT_CODEPOINT_MAX) {
             const glyph_gpu_index = self.glyph_renderer.direct_codepoint_table[@as(usize, string[0]) - DIRECT_CODEPOINT_MIN];
@@ -687,6 +643,7 @@ pub const Renderer = struct {
 
             cell.underline = underline_color.toPacked();
             cell.underline = (cell.underline & 0xffffff) | (@intFromEnum(underline_style) << 24);
+            cell.cursor_kind = @intFromEnum(cursor_kind);
         } else {
             // todo!();
         }
@@ -749,8 +706,9 @@ pub const Renderer = struct {
             );
         }
 
-        self.cell_count_x = self.terminal_width / self.cell_width;
-        self.cell_count_y = self.terminal_height / self.cell_height;
+        self.cell_count_x = (self.terminal_width + self.cell_width) / self.cell_width;
+        self.cell_count_y = (self.terminal_height + self.cell_height) / self.cell_height;
+        std.debug.print("cell count: {} {} {} {}\n", .{ self.cell_count_x, self.cell_count_y, self.terminal_width, self.terminal_height });
 
         const cell_count = self.cell_count_x * self.cell_count_y;
         if (cell_count >= self.cell_buffer_count) {
@@ -827,8 +785,8 @@ pub const Renderer = struct {
                 .map_one(self.d3d_context, ShaderParameters);
             mapped.cell_width = self.cell_width;
             mapped.cell_height = self.cell_height;
-            mapped.terminal_width = self.terminal_width / self.cell_width;
-            mapped.terminal_height = self.terminal_height / self.cell_height;
+            mapped.terminal_width = self.cell_count_x;
+            mapped.terminal_height = self.cell_count_y;
 
             const descent = @divTrunc(
                 @divTrunc(
@@ -852,8 +810,6 @@ pub const Renderer = struct {
                 @as(i64, font_metrics.designUnitsPerEm),
             );
 
-            std.debug.print("{} {} {} - {}    {}\n", .{ underline_position, self.cell_height, descent, (underline_position + @as(i64, self.cell_height) - descent), underline_size });
-
             mapped.underline_position_and_thickness =
                 @as(u32, @intCast((-underline_position + @as(i64, self.cell_height) - descent))) | @as(u32, @intCast(((underline_size) << 16)));
             self.parameter_buffer.unmap(self.d3d_context);
@@ -876,7 +832,7 @@ const ScreenCell = extern struct {
     gpu_index: GpuIndex,
     foreground: u32,
     background: u32,
-    curosr_kind: u32,
+    cursor_kind: u32,
     underline: u32,
 };
 
