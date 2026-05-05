@@ -734,16 +734,20 @@ pub const Node = struct {
 
     pub fn nextLeaf(self: *Node) ?*Node {
         var current = self;
+        var gone_right = false;
         while (current.parent) |parent| {
             if (parent.left == current) {
                 current = parent.right.?; // TODO: support null nodes
+                gone_right = true;
                 break;
             }
-            std.debug.assert(parent.right == self);
+            std.debug.assert(parent.right == current);
             current = parent;
         }
-        while (!current.isLeaf()) {
-            current = current.left.?;
+        if (gone_right) {
+            while (!current.isLeaf()) {
+                current = current.left.?;
+            }
         }
         if (current == self) return null;
         return current;
@@ -751,16 +755,20 @@ pub const Node = struct {
 
     pub fn previousLeaf(self: *Node) ?*Node {
         var current = self;
+        var gone_left = false;
         while (current.parent) |parent| {
             if (parent.right == current) {
                 current = parent.left.?; // TODO: support null nodes
+                gone_left = true;
                 break;
             }
-            std.debug.assert(parent.left == self);
+            std.debug.assert(parent.left == current);
             current = parent;
         }
-        while (!current.isLeaf()) {
-            current = current.right.?;
+        if (gone_left) {
+            while (!current.isLeaf()) {
+                current = current.right.?;
+            }
         }
         return current;
     }
@@ -1460,35 +1468,17 @@ fn appendString(self: *Self, string: Node.String) *Node {
     return new_right;
 }
 
-pub const ExpIterator = struct {
-    current: ?*Node,
-
-    pub fn next(self: *ExpIterator) ?*Node {
-        defer if (self.current) |c| {
-            self.current = c.nextLeaf();
-        };
-        return self.current;
-    }
-};
-
-pub fn expIterNode(root_node: *Node) ExpIterator {
-    var current: ?*Node = root_node;
-    while (current) |c| {
-        if (c.isLeaf()) break;
-        current = c.left;
-    }
-    return .{ .current = current };
-}
-
 pub fn deleteRange(self: *Self, start: usize, end: usize) ?struct { *Node, *Node } {
     if (self.root == null) return null;
     const lhs = self.split(self.root.?, start);
     const rhs = self.split(lhs[1], end - start);
     self.root = self.createNode(lhs[0], rhs[1]);
+    std.debug.print("delet range\n", .{});
 
     lhs[1].parent = null;
     rhs[0].parent = null;
-    var iter_ = expIterNode(lhs[1]);
+    var iter_ = self.nodeIterNode(lhs[1]);
+    dumpNodeToFile(lhs[1], "bruh.dot") catch @panic("fldsjf");
 
     while (iter_.next()) |leaf| {
         std.debug.print("leaf: {s}\n", .{leaf.string.items});
@@ -1496,7 +1486,7 @@ pub fn deleteRange(self: *Self, start: usize, end: usize) ?struct { *Node, *Node
     return .{ lhs[1], rhs[0] };
 }
 
-pub fn dumpNodeToFile(self: *Self, node: *Node, filename: []const u8) !void {
+pub fn dumpNodeToFile(node: *Node, filename: []const u8) !void {
     var io = std.Io.Threaded.init(std.heap.page_allocator, .{});
 
     var file = try std.Io.Dir.createFile(std.Io.Dir.cwd(), io.io(), filename, .{});
@@ -1504,7 +1494,7 @@ pub fn dumpNodeToFile(self: *Self, node: *Node, filename: []const u8) !void {
     var writer = file.writer(io.io(), &buffer);
 
     try writer.interface.print("digraph {{\n", .{});
-    _ = try self.dumpGraphImpl(node, 0, &writer.interface);
+    _ = try dumpGraphImpl(node, 0, &writer.interface);
     try writer.interface.print("}}\n", .{});
 
     try writer.interface.flush();
@@ -1513,11 +1503,11 @@ pub fn dumpNodeToFile(self: *Self, node: *Node, filename: []const u8) !void {
 
 pub fn dumpGraph(self: *Self, writer: *std.Io.Writer) !void {
     try writer.print("digraph {{\n", .{});
-    _ = try self.dumpGraphImpl(self.root.?, 0, writer);
+    _ = try dumpGraphImpl(self.root.?, 0, writer);
     try writer.print("}}\n", .{});
 }
 
-pub fn dumpGraphImpl(self: *Self, node: *Node, id: usize, writer: *std.Io.Writer) !usize {
+pub fn dumpGraphImpl(node: *Node, id: usize, writer: *std.Io.Writer) !usize {
     const my_id = id;
     if (node.isLeaf()) {
         try writer.print("node{} [label=\"{}\\n", .{ my_id, node.total_length });
@@ -1537,12 +1527,12 @@ pub fn dumpGraphImpl(self: *Self, node: *Node, id: usize, writer: *std.Io.Writer
         try writer.print("node{} [label=\"{}\"];\n", .{ my_id, node.total_length });
 
         if (node.left) |left| {
-            next_id = try self.dumpGraphImpl(left, id + 1, writer);
+            next_id = try dumpGraphImpl(left, id + 1, writer);
             try writer.print("node{} -> node{}\n", .{ my_id, id + 1 });
         }
         if (node.right) |right| {
             const this_id = next_id;
-            next_id = try self.dumpGraphImpl(right, this_id, writer);
+            next_id = try dumpGraphImpl(right, this_id, writer);
             try writer.print("node{} -> node{}\n", .{ my_id, this_id });
         }
 
@@ -1612,70 +1602,62 @@ pub fn iterNode(self: *Self, node: ?*Node, allocator: std.mem.Allocator) Iterato
 }
 
 pub const Utf16Iterator = struct {
-    allocator: std.mem.Allocator,
-    stack: std.ArrayList(*Node),
+    node_iter: NodeIterator,
     index: usize = 0,
+    current_node: ?*Node,
     output_buffer: *[2]u16,
 
     pub fn next(self: *Utf16Iterator) ?struct { []u16, usize } {
-        const current = self.stack.getLastOrNull() orelse return null;
-
-        if (self.index >= current.string.items.len) {
-            var left = self.stack.pop() orelse return null;
-
-            if (self.stack.pop()) |parent| {
-                if (parent.right) |right| {
-                    self.stack.append(self.allocator, right) catch @panic("OOM");
-
-                    var next_left = right.left;
-                    left = right;
-                    while (next_left != null) {
-                        self.stack.append(self.allocator, next_left.?) catch @panic("OOM");
-                        left = next_left.?;
-                        next_left = next_left.?.left;
-                    }
-                }
-            } else return null;
-
-            const codepoint_length = std.unicode.utf8ByteSequenceLength(left.string.items[0]) catch @panic("invlaid utf8");
-            const length = std.unicode.utf8ToUtf16Le(self.output_buffer.*[0..], left.string.items[0..codepoint_length]) catch @panic("invalid utf8");
-            defer self.index = length;
-
-            return .{ self.output_buffer.*[0..length], codepoint_length };
-        } else {
-            const codepoint_length = std.unicode.utf8ByteSequenceLength(current.string.items[self.index]) catch @panic("invlaid utf8");
-            const length = std.unicode.utf8ToUtf16Le(self.output_buffer.*[0..], current.string.items[self.index .. self.index + codepoint_length]) catch @panic("invalid utf8");
-            defer self.index += length;
-
-            return .{ self.output_buffer.*[0..length], codepoint_length };
+        while (self.current_node != null and self.index >= self.current_node.?.string.items.len) {
+            self.current_node = self.node_iter.next();
+            self.index = 0;
         }
-    }
+        const current = self.current_node orelse return null;
 
-    pub fn deinit(self: *Iterator) void {
-        self.stack.deinit(self.allocator);
+        const codepoint_length = std.unicode.utf8ByteSequenceLength(current.string.items[self.index]) catch @panic("invlaid utf8");
+        const length = std.unicode.utf8ToUtf16Le(self.output_buffer.*[0..], current.string.items[self.index .. self.index + codepoint_length]) catch @panic("invalid utf8");
+        defer self.index += length;
+
+        return .{ self.output_buffer.*[0..length], codepoint_length };
     }
 };
 
-pub fn iterUtf16(self: *Self, output_buffer: *[2]u16, allocator: std.mem.Allocator) Utf16Iterator {
-    var current = self.root;
+pub fn iterUtf16(self: *Self, output_buffer: *[2]u16) Utf16Iterator {
+    var node_iter = self.nodeIter();
+    const start_node = node_iter.next();
+    return .{
+        .node_iter = node_iter,
+        .current_node = start_node,
+        .output_buffer = output_buffer,
+    };
+}
 
-    var stack = std.ArrayList(*Node).empty;
-    while (current != null) {
-        stack.append(allocator, current.?) catch @panic("OOM");
-        current = current.?.left;
-    }
-
-    return .{ .allocator = allocator, .stack = stack, .output_buffer = output_buffer };
+pub fn iterUtf16StartingFrom(self: *Self, output_buffer: *[2]u16, position: Position) Utf16Iterator {
+    var node_iter = self.nodeIter();
+    const start_node, const start_offset = self.indexNode(position) orelse return .{
+        .node_iter = .{ .root = null, .current = null },
+        .current_node = null,
+        .output_buffer = output_buffer,
+    };
+    node_iter.current = start_node.nextLeaf();
+    return .{
+        .node_iter = node_iter,
+        .current_node = start_node,
+        .output_buffer = output_buffer,
+        .index = start_offset,
+    };
 }
 
 pub const NodeIterator = struct {
+    root: ?*Node,
     current: ?*Node,
 
     pub fn next(self: *NodeIterator) ?*Node {
-        defer if (self.current) |c| {
+        const result = self.current;
+        if (self.current) |c| {
             self.current = c.nextLeaf();
-        };
-        return self.current;
+        }
+        return result;
     }
 };
 
@@ -1684,13 +1666,13 @@ pub inline fn nodeIter(self: *Self) NodeIterator {
 }
 
 pub fn nodeIterNode(self: *Self, root_node: ?*Node) NodeIterator {
-    _ = self;
+    // _ = self;
     var current: ?*Node = root_node;
     while (current) |c| {
         if (c.isLeaf()) break;
         current = c.left;
     }
-    return .{ .current = current };
+    return .{ .root = self.root, .current = current };
 }
 
 /// Returns the node, and the relative string offset into the node
@@ -1766,8 +1748,8 @@ pub fn previousNodeChar(self: *Self, node: *Node, node_offset: usize) ?struct { 
 
 /// Anchor must be at the start of a line
 /// Get the line and column at position
-pub fn lineColumnFromRelativePosition(self: *Self, anchor: usize, position: usize) struct { u32, u32 } {
-    var current_node, var current_node_offset = self.indexNode(anchor).?;
+pub fn lineColumnFromRelativePosition(self: *Self, anchor: usize, position: usize) ?Coordinate {
+    var current_node, var current_node_offset = self.indexNode(anchor) orelse return null;
 
     var current_offset = anchor;
     var line: u32 = 0;
@@ -1787,7 +1769,246 @@ pub fn lineColumnFromRelativePosition(self: *Self, anchor: usize, position: usiz
         current_node, current_node_offset = self.nextNodeChar(current_node, current_node_offset) orelse break;
     }
 
+    return .{ .line = line, .column = column };
+}
+
+/// Position should be start of line
+pub fn addLineOffsetToPosition(self: *Self, position: usize, line_offset: u32) void {
+    var current_node, var current_node_offset = self.indexNode(position).?;
+
+    var current_offset = position;
+    var line: u32 = 0;
+    var column: u32 = 0;
+
+    while (current_offset < self.len and line < line_offset) : (current_offset += 1) {
+        switch (current_node.string.items[current_node_offset]) {
+            '\r' => {},
+            '\n' => {
+                column = 0;
+                line += 1;
+            },
+            else => {
+                column += 1;
+            },
+        }
+        current_node, current_node_offset = self.nextNodeChar(current_node, current_node_offset) orelse break;
+    }
+
     return .{ column, line };
+}
+
+pub const Position = usize;
+pub const Coordinate = struct { line: u32, column: u32 };
+
+pub fn add(self: *Self, a: anytype, b: anytype, comptime T: type) T {
+    const Ta = if (@TypeOf(a) == comptime_int) Position else @TypeOf(a);
+    const Tb = if (@TypeOf(b) == comptime_int) Position else @TypeOf(b);
+    if (Ta == Position and Tb == Position) {
+        if (T == Position) {
+            return a + b;
+        } else if (T == Coordinate) {
+            var current_node, var current_node_offset = self.indexNode(0).?;
+
+            var current_offset: usize = 0;
+            var line: u32 = 0;
+            var column: u32 = 0;
+
+            while (current_offset < a + b) : (current_offset += 1) {
+                switch (current_node.string.items[current_node_offset]) {
+                    '\r' => {},
+                    '\n' => {
+                        column = 0;
+                        line += 1;
+                    },
+                    else => {
+                        column += 1;
+                    },
+                }
+                current_node, current_node_offset = self.nextNodeChar(current_node, current_node_offset) orelse break;
+            }
+
+            return .{ .line = line, .column = column };
+        } else {
+            @compileError("Invalid result type");
+        }
+    } else if (Ta == Coordinate and Tb == Position) {
+        var current_node, var current_node_offset = self.indexNode(0).?;
+
+        var current_offset: usize = 0;
+        var line: u32 = 0;
+        var column: u32 = 0;
+
+        while (current_offset < self.len) : (current_offset += 1) {
+            if (line == a.line and column == a.column) {
+                break;
+            }
+            switch (current_node.string.items[current_node_offset]) {
+                '\r' => {},
+                '\n' => {
+                    if (line == a.line) {
+                        break;
+                    }
+
+                    column = 0;
+                    line += 1;
+                },
+                else => {
+                    column += 1;
+                },
+            }
+            current_node, current_node_offset = self.nextNodeChar(current_node, current_node_offset) orelse break;
+        }
+
+        while (current_offset < b and current_offset < self.len) : (current_offset += 1) {
+            switch (current_node.string.items[current_node_offset]) {
+                '\r' => {},
+                '\n' => {
+                    column = 0;
+                    line += 1;
+                },
+                else => {
+                    column += 1;
+                },
+            }
+            current_node, current_node_offset = self.nextNodeChar(current_node, current_node_offset) orelse break;
+        }
+
+        if (T == Position) {
+            return current_offset;
+        } else if (T == Coordinate) {
+            return .{ .line = line, .column = column };
+        } else @compileError("Unsupported result type");
+    } else if (Ta == Position and Tb == Coordinate) {
+        var current_node, var current_node_offset = self.indexNode(a).?;
+
+        var current_offset = a;
+        var line: u32 = 0;
+        var column: u32 = 0;
+
+        while (current_offset < self.len) : (current_offset += 1) {
+            if (line == b.line and column == b.column) {
+                break;
+            }
+            switch (current_node.string.items[current_node_offset]) {
+                '\r' => {},
+                '\n' => {
+                    if (line == b.line) {
+                        break;
+                    }
+                    column = 0;
+                    line += 1;
+                },
+                else => {
+                    column += 1;
+                },
+            }
+            current_node, current_node_offset = self.nextNodeChar(current_node, current_node_offset) orelse break;
+        }
+
+        if (current_offset + 1 >= self.len and line != b.line) {
+            const line_range = self.getLineRange(current_offset).?;
+            current_offset = @min(line_range[0] + b.column, line_range[1]);
+        }
+
+        if (T == Position) {
+            return current_offset;
+        } else if (T == Coordinate) {
+            return .{ .line = line, .column = column };
+        } else @compileError("Unsupported result type");
+    } else @compileError(std.fmt.comptimePrint("Unsupported input types {} and {}", .{ Ta, Tb }));
+}
+
+pub fn sub(self: *Self, a: anytype, b: anytype, comptime T: type) T {
+    const Ta = if (@TypeOf(a) == comptime_int) Position else @TypeOf(a);
+    const Tb = if (@TypeOf(b) == comptime_int) Position else @TypeOf(b);
+    if (Ta == Position and Tb == Position) {
+        if (T == Position) {
+            return a -| b;
+        } else if (T == Coordinate) {
+            var current_node, var current_node_offset = self.indexNode(0).?;
+
+            var current_offset: usize = 0;
+            var line: u32 = 0;
+            var column: u32 = 0;
+
+            while (current_offset < a -| b) : (current_offset += 1) {
+                switch (current_node.string.items[current_node_offset]) {
+                    '\r' => {},
+                    '\n' => {
+                        column = 0;
+                        line += 1;
+                    },
+                    else => {
+                        column += 1;
+                    },
+                }
+                current_node, current_node_offset = self.previousNodeChar(current_node, current_node_offset) orelse break;
+            }
+
+            return .{ .line = line, .column = column };
+        } else {
+            @compileError("Invalid result type");
+        }
+    } else if (Ta == Coordinate and Tb == Position) {
+        var current_node, var current_node_offset = self.indexNode(0).?;
+
+        var current_offset: usize = 0;
+        var line: u32 = a.line;
+        var column: u32 = b.column;
+
+        while (current_offset > b) : (current_offset -= 1) {
+            switch (current_node.string.items[current_node_offset]) {
+                '\r' => {},
+                '\n' => {
+                    column = 0;
+                    line -= 1;
+                },
+                else => {
+                    column -= 1;
+                },
+            }
+            current_node, current_node_offset = self.previousNodeChar(current_node, current_node_offset) orelse break;
+        }
+
+        if (T == Position) {
+            return current_offset;
+        } else if (T == Coordinate) {
+            return .{ .line = line, .column = column };
+        } else @compileError("Unsupported result type");
+    } else if (Ta == Position and Tb == Coordinate) {
+        var current_node, var current_node_offset = self.indexNode(a).?;
+        std.debug.assert(b.column == 0); // @Cleanup: Not sure how to handle this yet
+
+        var current_offset = a;
+        var line: u32 = 0;
+
+        while (current_offset > 0) : (current_offset -= 1) {
+            if (line == b.line) {
+                current_offset += 1;
+                break;
+            }
+            switch (current_node.string.items[current_node_offset]) {
+                '\r' => {},
+                '\n' => {
+                    line += 1;
+                    if (line == b.line) {
+                        const line_range = self.getLineRange(current_offset).?;
+                        current_offset = @min(line_range[0] + b.column, line_range[1]);
+                        break;
+                    }
+                },
+                else => {},
+            }
+            current_node, current_node_offset = self.previousNodeChar(current_node, current_node_offset) orelse break;
+        }
+
+        if (T == Position) {
+            return current_offset;
+        } else if (T == Coordinate) {
+            // return .{ .line = line, .column = column };
+            unreachable;
+        } else @compileError("Unsupported result type");
+    } else @compileError(std.fmt.comptimePrint("Unsupported input types {} and {}", .{ Ta, Tb }));
 }
 
 /// Returns the line start (inclusive), and the line end (inclusive; includes the newline)
@@ -1827,7 +2048,7 @@ pub fn getLineRange(self: *Self, position: usize) ?struct { usize, usize } {
         current_node, current_node_offset = self.nextNodeChar(current_node, current_node_offset) orelse break;
     }
 
-    return .{ line_start, line_end };
+    return .{ line_start, line_end + 1 };
 }
 
 pub fn getNextLineRange(self: *Self, position: usize) ?struct { usize, usize } {
@@ -1845,6 +2066,7 @@ pub fn getNextLineRange(self: *Self, position: usize) ?struct { usize, usize } {
                 if (remaining_lines == 0) {
                     break;
                 }
+                if (current_offset + 1 >= self.len) return null; // prevents jumping to eol at eof
                 last_line_start = current_offset + 1;
             },
             else => {},
@@ -1855,7 +2077,7 @@ pub fn getNextLineRange(self: *Self, position: usize) ?struct { usize, usize } {
         current_node, current_node_offset = self.nextNodeChar(current_node, current_node_offset) orelse break;
     }
 
-    return .{ last_line_start, current_offset };
+    return .{ last_line_start, current_offset + 1 };
 }
 
 pub fn getPreviousLineRange(self: *Self, position: usize) ?struct { usize, usize } {
@@ -1885,7 +2107,7 @@ pub fn getPreviousLineRange(self: *Self, position: usize) ?struct { usize, usize
         current_node, current_node_offset = self.previousNodeChar(current_node, current_node_offset) orelse break;
     }
 
-    return .{ current_offset, last_line_end };
+    return .{ current_offset, last_line_end + 1 };
 }
 
 pub fn getNextWord(self: *Self, position: usize) usize {
@@ -1901,7 +2123,7 @@ pub fn getNextWord(self: *Self, position: usize) usize {
             ' ', '\n', '\r', '\t' => {
                 has_done_whitespace = true;
             },
-            'a'...'z', 'A'...'Z', '0'...'9' => {
+            'a'...'z', 'A'...'Z', '0'...'9', '_', '-' => {
                 if (has_done_other or has_done_whitespace) break;
                 has_done_word = true;
             },
@@ -1934,7 +2156,7 @@ pub fn getNextWordEnd(self: *Self, position: usize) usize {
                 }
                 has_done_whitespace = true;
             },
-            'a'...'z', 'A'...'Z', '0'...'9' => {
+            'a'...'z', 'A'...'Z', '0'...'9', '_', '-' => {
                 if (has_done_other) {
                     current_offset -|= 1;
                     break;
@@ -1973,7 +2195,7 @@ pub fn getPreviousWord(self: *Self, position: usize) usize {
                 }
                 has_done_whitespace = true;
             },
-            'a'...'z', 'A'...'Z', '0'...'9' => {
+            'a'...'z', 'A'...'Z', '0'...'9', '_', '-' => {
                 if (has_done_other) {
                     current_offset += 1;
                     break;

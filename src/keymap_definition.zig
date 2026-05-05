@@ -7,9 +7,9 @@ pub const keymap_definition = .{
     .{ 'i', "commandEnterInsertMode" },
     .{ 'd', movement, "commandDeleteMovement" },
     .{ 'd', 'd', "commandDeleteLine" },
+
+    .{ .{ ctrl, 'u' }, "commandMoveUpHalfView" },
+    .{ .{ ctrl, 'd' }, "commandMoveDownHalfView" },
+
     .{ movement, "commandMove" },
-    // .{ 'd', "d_command" },
-    // .{ .{ ctrl, 'd' }, "go_down" },
-    // .{ 'd', 'a', "d_a_command" },
-    // .{ 'a', "a_command" },
 };

@@ -35,18 +35,40 @@ const Movement = enum {
     word_forward,
     word_backward,
     word_end_forward,
+    start_of_line,
+    start_of_line_non_blank,
+    end_of_line,
 };
 
-pub fn movementKeys(movement_: Movement) u8 {
-    return switch (movement_) {
-        .left => 'h',
-        .right => 'l',
-        .up => 'k',
-        .down => 'j',
-        .word_forward => 'w',
-        .word_backward => 'b',
-        .word_end_forward => 'e',
+pub fn movementTupleToCombo(movement_tuple: anytype) KeyCombo {
+    var key = KeyCombo{ .char = 0 };
+
+    inline for (movement_tuple) |sub_key| {
+        switch (sub_key) {
+            ctrl => key.ctrl = 1,
+            shift => key.shift = 1,
+            alt => key.alt = 1,
+            else => key.char = @truncate(sub_key),
+        }
+    }
+
+    return key;
+}
+
+pub fn movementKeysCombo(comptime movement_: Movement) KeyCombo {
+    const value = switch (movement_) {
+        .left => .{'h'},
+        .right => .{'l'},
+        .up => .{'k'},
+        .down => .{'j'},
+        .word_forward => .{'w'},
+        .word_backward => .{'b'},
+        .word_end_forward => .{'e'},
+        .start_of_line => .{'0'},
+        .start_of_line_non_blank => .{'_'},
+        .end_of_line => .{'$'},
     };
+    return movementTupleToCombo(value);
 }
 
 const KeyNode = struct {
@@ -69,7 +91,7 @@ fn generate(writer: *std.Io.Writer, comptime keymap: anytype) !void {
             if (i == command.len - 1) {
                 if (done_movement) {
                     inline for (std.meta.fields(Movement)) |field| {
-                        current.keys.get(.{ .char = @truncate(movementKeys(@enumFromInt(field.value))) }).?.leaf = @as([]const u8, item);
+                        current.keys.get(movementKeysCombo(@enumFromInt(field.value))).?.leaf = @as([]const u8, item);
                     }
                 } else {
                     current.leaf = item;
@@ -78,7 +100,7 @@ fn generate(writer: *std.Io.Writer, comptime keymap: anytype) !void {
                 if (@TypeOf(item) == comptime_int or @TypeOf(item) == u32) {
                     if (item == movement) {
                         inline for (std.meta.fields(Movement)) |field| {
-                            const result = try current.keys.getOrPut(allocator, .{ .char = @truncate(movementKeys(@enumFromInt(field.value))) });
+                            const result = try current.keys.getOrPut(allocator, movementKeysCombo(@enumFromInt(field.value)));
                             if (!result.found_existing) {
                                 const new_node = try allocator.create(KeyNode);
                                 new_node.* = .{
@@ -100,17 +122,7 @@ fn generate(writer: *std.Io.Writer, comptime keymap: anytype) !void {
                 } else if (@typeInfo(@TypeOf(item)) == .@"struct") {
                     const new_node = try allocator.create(KeyNode);
                     new_node.* = .{};
-                    var key = KeyCombo{ .char = 0 };
-
-                    inline for (item) |sub_key| {
-                        switch (sub_key) {
-                            ctrl => key.ctrl = 1,
-                            shift => key.shift = 1,
-                            alt => key.alt = 1,
-                            else => key.char = @truncate(sub_key),
-                        }
-                    }
-                    try current.keys.put(allocator, key, new_node);
+                    try current.keys.put(allocator, movementTupleToCombo(item), new_node);
 
                     current = new_node;
                 } else @compileError(std.fmt.comptimePrint("invalid type: {}", .{@TypeOf(item)}));
@@ -120,8 +132,7 @@ fn generate(writer: *std.Io.Writer, comptime keymap: anytype) !void {
 
     var state_var: usize = 1;
     _ = try writer.write("pub const DispatchResult = enum { not_mapped, waiting, dispatched_command };\n");
-    _ = try writer.write("pub const KeyMovement = struct { cursor_position: usize = 0, max_column: usize = 0 };\n");
-    _ = try writer.write("pub const DispatchState = struct { state: usize = 0, key_movement: KeyMovement = .{} };\n");
+    _ = try writer.write("pub const DispatchState = struct { state: usize = 0 };\n");
     _ = try writer.write("pub fn dispatchCommand(state: *DispatchState, key: u16, command_handlers: anytype) DispatchResult {\n");
 
     for (0..1) |_| _ = try writer.write("    ");

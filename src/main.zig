@@ -41,11 +41,19 @@ fn window_proc(hwnd: win32.HWND, message: win32.UINT, wparam: win32.WPARAM, lpar
                     .key_down = .{
                         .key = .escape,
                         .char = 0,
+                        .modifers = .{
+                            .ctrl = if (@as(u16, @bitCast(win32.GetKeyState(win32.VK_CONTROL))) & 0x8000 > 0) 1 else 0,
+                            .shift = if (@as(u16, @bitCast(win32.GetKeyState(win32.VK_SHIFT))) & 0x8000 > 0) 1 else 0,
+                            .alt = if (@as(u16, @bitCast(win32.GetKeyState(win32.VK_MENU))) & 0x8000 > 0) 1 else 0,
+                        },
                     },
                 },
                 else => blk: {
                     var keystate: [256]u8 = undefined;
                     _ = win32.GetKeyboardState(&keystate[0]);
+                    keystate[win32.VK_CONTROL] = 0;
+                    keystate[win32.VK_SHIFT] = 0;
+                    keystate[win32.VK_MENU] = 0;
 
                     const scancode = (lparam >> 16) & 0xFF;
                     var char: u16 = 0;
@@ -56,6 +64,11 @@ fn window_proc(hwnd: win32.HWND, message: win32.UINT, wparam: win32.WPARAM, lpar
                             .key_down = .{
                                 .key = .char,
                                 .char = char,
+                                .modifers = .{
+                                    .ctrl = if (@as(u16, @bitCast(win32.GetKeyState(win32.VK_CONTROL))) & 0x8000 > 0) 1 else 0,
+                                    .shift = if (@as(u16, @bitCast(win32.GetKeyState(win32.VK_SHIFT))) & 0x8000 > 0) 1 else 0,
+                                    .alt = if (@as(u16, @bitCast(win32.GetKeyState(win32.VK_MENU))) & 0x8000 > 0) 1 else 0,
+                                },
                             },
                         };
                     } else break :blk null;
@@ -124,6 +137,7 @@ pub const Application = struct {
 
     pub fn resize(self: *Application, width: u32, height: u32) void {
         self.renderer.resize_if_needed(width, height);
+        if (self.editor) |e| e.resize(self.renderer.cell_count_y, self.renderer.cell_count_x);
         self.draw();
     }
 
