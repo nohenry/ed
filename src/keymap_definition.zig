@@ -5,10 +5,19 @@ const movement: u32 = 400000;
 
 pub const normal_keymap_definition = .{
     .{ 'i', "commandEnterInsertMode" },
+    .{ 'a', "commandEnterInsertModeAppend" },
+    .{ 'I', "commandEnterInsertModeStartOfLine" },
+    .{ 'A', "commandEnterInsertModeEndOfLine" },
+    .{ 'O', "commandEnterInsertModeAboveLine" },
+    .{ 'o', "commandEnterInsertModeBelowLine" },
     .{ 'v', "commandEnterVisualMode" },
 
     .{ 'd', movement, "commandDeleteMovement" },
     .{ 'd', 'd', "commandDeleteLine" },
+
+    .{ 'c', movement, "commandChangeMovement" },
+
+    .{ 'x', "commandDeleteUnder" },
 
     .{ .{ ctrl, 'u' }, "commandMoveUpHalfView" },
     .{ .{ ctrl, 'd' }, "commandMoveDownHalfView" },
@@ -18,8 +27,16 @@ pub const normal_keymap_definition = .{
 
 pub const visual_keymap_definition = .{
     .{ 'd', "commandVisualDelete" },
+    .{ 'c', "commandVisualChange" },
+    .{ 'x', "commandDeleteUnder" },
+
     .{ '*', "commandVisualSearch" },
+    .{ '#', "commandVisualSearchReverse" },
     .{ 'n', "commandVisualSearchNext" },
     .{ 'N', "commandVisualSearchPrev" },
+
+    .{ .{ ctrl, 'u' }, "commandMoveUpHalfView" },
+    .{ .{ ctrl, 'd' }, "commandMoveDownHalfView" },
+
     .{ movement, "commandMove" },
 };

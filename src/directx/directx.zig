@@ -351,15 +351,21 @@ pub const Renderer = struct {
 
         var shader_code: *d3d.ID3DBlob = undefined;
         var shader_errors: *d3d.ID3DBlob = undefined;
-        if (failed(d3d.D3DCompile(
-            compute_shader_source.ptr,
-            compute_shader_source.len,
-            "shader.hlsl",
+
+        var file_buf = std.mem.zeroes([512]u16);
+        const file_buf_len = std.unicode.utf8ToUtf16Le(&file_buf, "src/directx/shader.hlsl") catch @panic("Error encoding utf16");
+        const filename = file_buf[0..file_buf_len];
+
+        if (failed(d3d.D3DCompileFromFile(
+            // compute_shader_source.ptr,
+            // compute_shader_source.len,
+            // "shader.hlsl",
+            filename.ptr,
             null,
             null,
             "ComputeMain",
             "cs_5_0",
-            0,
+            win32.D3DCOMPILE_DEBUG | win32.D3DCOMPILE_SKIP_OPTIMIZATION,
             0,
             @ptrCast(&shader_code),
             @ptrCast(&shader_errors),
@@ -369,6 +375,24 @@ pub const Renderer = struct {
             error_slice.len = shader_errors.lpVtbl.*.GetBufferSize.?(shader_errors);
             std.debug.panic("Error compiling d3d shaders:\n{s}", .{error_slice});
         }
+        // if (failed(d3d.D3DCompile(
+        //     compute_shader_source.ptr,
+        //     compute_shader_source.len,
+        //     "shader.hlsl",
+        //     null,
+        //     null,
+        //     "ComputeMain",
+        //     "cs_5_0",
+        //     win32.D3DCOMPILE_DEBUG | win32.D3DCOMPILE_SKIP_OPTIMIZATION,
+        //     0,
+        //     @ptrCast(&shader_code),
+        //     @ptrCast(&shader_errors),
+        // ))) {
+        //     var error_slice: []const u8 = undefined;
+        //     error_slice.ptr = @ptrCast(shader_errors.lpVtbl.*.GetBufferPointer.?(shader_errors));
+        //     error_slice.len = shader_errors.lpVtbl.*.GetBufferSize.?(shader_errors);
+        //     std.debug.panic("Error compiling d3d shaders:\n{s}", .{error_slice});
+        // }
         var compute_shader: *d3d.ID3D11ComputeShader = undefined;
         if (failed(d3d_device.lpVtbl.*.CreateComputeShader.?(
             d3d_device,

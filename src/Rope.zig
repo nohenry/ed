@@ -750,9 +750,9 @@ pub const Node = struct {
             while (!current.isLeaf()) {
                 current = current.left.?;
             }
+            return current;
         }
-        if (current == self) return null;
-        return current;
+        return null;
     }
 
     pub fn previousLeaf(self: *Node) ?*Node {
@@ -771,9 +771,9 @@ pub const Node = struct {
             while (!current.isLeaf()) {
                 current = current.right.?;
             }
+            return current;
         }
-        if (current == self) return null;
-        return current;
+        return null;
     }
 
     /// Get the next character and its node, relative to the given node, and character offset of that node.
