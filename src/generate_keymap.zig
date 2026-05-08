@@ -12,7 +12,7 @@ pub fn main(init: std.process.Init) !void {
     var writer = file.writer(init.io, &.{});
 
     _ = try writer.interface.write("pub const DispatchResult = enum { not_mapped, waiting, dispatched_command };\n");
-    _ = try writer.interface.write("pub const DispatchState = struct { state: usize = 0 };\n");
+    _ = try writer.interface.write("pub const DispatchState = struct { state: usize = 0, characters: [4]u32 = [4]u32{0,0,0,0}, character_count: usize = 0, };\n");
 
     try generate(&writer.interface, "dispatchNormalCommand", @import("keymap_definition.zig").normal_keymap_definition);
     try generate(&writer.interface, "dispatchVisualCommand", @import("keymap_definition.zig").visual_keymap_definition);
@@ -22,6 +22,7 @@ const ctrl: u32 = 100000;
 const alt: u32 = 200000;
 const shift: u32 = 300000;
 const movement: u32 = 400000;
+const character: u32 = 500000;
 
 const KeyCombo = packed struct(u16) {
     char: u7,
@@ -42,6 +43,13 @@ const Movement = enum {
     start_of_line,
     start_of_line_non_blank,
     end_of_line,
+
+    find_next,
+    find_prev,
+    find_till_next,
+    find_till_prev,
+    find_again_next,
+    find_again_prev,
 };
 
 pub fn movementTupleToCombo(movement_tuple: anytype) KeyCombo {
@@ -71,13 +79,34 @@ pub fn movementKeysCombo(comptime movement_: Movement) KeyCombo {
         .start_of_line => .{'0'},
         .start_of_line_non_blank => .{'_'},
         .end_of_line => .{'$'},
+
+        .find_next => .{'f'},
+        .find_prev => .{'F'},
+        .find_till_next => .{'t'},
+        .find_till_prev => .{'T'},
+        .find_again_next => .{';'},
+        .find_again_prev => .{','},
     };
     return movementTupleToCombo(value);
+}
+
+pub fn movementKeysNeedsChar(comptime movement_: Movement) bool {
+    return switch (movement_) {
+        .find_next,
+        .find_prev,
+        .find_till_next,
+        .find_till_prev,
+        .find_again_next,
+        .find_again_prev,
+        => true,
+        else => false,
+    };
 }
 
 const KeyNode = struct {
     leaf: ?[]const u8 = null,
     leaf_movement: ?Movement = null,
+    leaf_character: bool = false,
     keys: std.AutoHashMapUnmanaged(KeyCombo, *KeyNode) = .empty,
     state: usize = 0,
 };
@@ -91,9 +120,12 @@ fn generate(writer: *std.Io.Writer, dispatch_function_name: []const u8, comptime
         var current = &root;
 
         var done_movement = false;
+        var done_character = false;
         inline for (command, 0..) |item, i| {
             if (i == command.len - 1) {
-                if (done_movement) {
+                if (current.leaf_character) {
+                    current.leaf = item;
+                } else if (done_movement) {
                     inline for (std.meta.fields(Movement)) |field| {
                         current.keys.get(movementKeysCombo(@enumFromInt(field.value))).?.leaf = @as([]const u8, item);
                     }
@@ -109,11 +141,24 @@ fn generate(writer: *std.Io.Writer, dispatch_function_name: []const u8, comptime
                                 const new_node = try allocator.create(KeyNode);
                                 new_node.* = .{
                                     .leaf_movement = @enumFromInt(field.value),
+                                    .leaf_character = movementKeysNeedsChar(@enumFromInt(field.value)),
                                 };
                                 result.value_ptr.* = new_node;
                             }
                         }
                         done_movement = true;
+                    } else if (item == character) {
+                        current.leaf_character = true;
+                        // const result = try current.keys.getOrPut(allocator, .{ .char = @truncate(item) });
+                        // if (!result.found_existing) {
+                        //     const new_node = try allocator.create(KeyNode);
+                        //     new_node.* = .{
+                        //         .leaf_character = true,
+                        //     };
+                        //     result.value_ptr.* = new_node;
+                        // }
+                        // current = result.value_ptr.*;
+                        done_character = true;
                     } else {
                         const result = try current.keys.getOrPut(allocator, .{ .char = @truncate(item) });
                         if (!result.found_existing) {
@@ -161,10 +206,20 @@ fn generate_zig_code(writer: *std.Io.Writer, node: *KeyNode, state_var: *usize, 
         return;
     }
 
+    var iter = node.keys.iterator();
+    if (node.leaf_character) {
+        const this_state = state_var.*;
+
+        for (0..i) |_| _ = try writer.write("    ");
+        try writer.print("{} => {{ state.characters[state.character_count] = key; state.character_count += 1; state.state = {}; return .waiting; }},\n", .{ node.state, this_state });
+
+        node.state = this_state;
+        state_var.* += 1;
+    }
+
     for (0..i) |_| _ = try writer.write("    ");
     try writer.print("{} => switch (key) {{\n", .{node.state});
 
-    var iter = node.keys.iterator();
     while (iter.next()) |entry| {
         for (0..i + 1) |_| _ = try writer.write("    ");
         const k = entry.key_ptr.*;
@@ -176,6 +231,12 @@ fn generate_zig_code(writer: *std.Io.Writer, node: *KeyNode, state_var: *usize, 
         if (entry.value_ptr.*.leaf) |leaf| {
             if (entry.value_ptr.*.leaf_movement) |movement_| {
                 try writer.print("command_handlers.{s}(.{t}),\n", .{ leaf, movement_ });
+            } else if (entry.value_ptr.*.leaf_character) {
+                const this_state = state_var.*;
+                try writer.print("{{ state.state = {}; return .waiting; }},\n", .{this_state});
+
+                entry.value_ptr.*.state = this_state;
+                state_var.* += 1;
             } else {
                 try writer.print("command_handlers.{s}(null),\n", .{leaf});
             }
@@ -195,8 +256,26 @@ fn generate_zig_code(writer: *std.Io.Writer, node: *KeyNode, state_var: *usize, 
 
     iter = node.keys.iterator();
     while (iter.next()) |entry| {
-        if (entry.value_ptr.*.leaf == null and entry.value_ptr.*.leaf_movement == null) {
-            try generate_zig_code(writer, entry.value_ptr.*, state_var, i);
+        if (entry.value_ptr.*.leaf_character) {
+            if (entry.value_ptr.*.leaf != null) {
+                for (0..i) |_| _ = try writer.write("    ");
+
+                if (entry.value_ptr.*.leaf_movement) |movement_| {
+                    try writer.print("{} => command_handlers.{s}(.{t}, key),\n", .{ entry.value_ptr.*.state, entry.value_ptr.*.leaf.?, movement_ });
+                } else {
+                    try writer.print("{} => command_handlers.{s}(key),\n", .{ entry.value_ptr.*.state, entry.value_ptr.*.leaf.? });
+                }
+
+                // try generate_zig_code(writer, entry.value_ptr.*, state_var, i);
+            }
+
+            if (entry.value_ptr.*.leaf == null and entry.value_ptr.*.leaf_movement == null) {
+                try generate_zig_code(writer, entry.value_ptr.*, state_var, i);
+            }
+        } else {
+            if (entry.value_ptr.*.leaf == null and entry.value_ptr.*.leaf_movement == null) {
+                try generate_zig_code(writer, entry.value_ptr.*, state_var, i);
+            }
         }
     }
 }

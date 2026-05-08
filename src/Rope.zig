@@ -1468,6 +1468,40 @@ pub fn insertString(self: *Self, index: usize, string: []const u8) *Node {
     return leaf_node;
 }
 
+/// Inserts the given string at the given index.
+/// String is copied, and an allocated node is inserted.
+///
+/// The root node must not be empty.
+pub fn insertSplat(self: *Self, index: usize, char: u8, count: usize) *Node {
+    std.debug.assert(self.root != null);
+    const current = self.root.?;
+
+    // const allocated_string = Node.String.initReadonly(string);
+    var allocated_string = Node.String.initCapacity(self.allocator, count) catch @panic("OOM");
+    for (allocated_string.addManyAsSliceAssumeCapacity(count)) |*a| {
+        a.* = char;
+    }
+
+    defer self.len += count;
+    if (index == 0) {
+        return self.prependString(allocated_string);
+    } else if (index == self.len) {
+        return self.appendString(allocated_string);
+    }
+
+    var lhs, var rhs = self.split(current, index);
+    const leaf_node = self.createLeafNode(allocated_string);
+    if (self.balance_state % 2 == 0) {
+        lhs = self.createNode(lhs, leaf_node);
+    } else {
+        rhs = self.createNode(leaf_node, rhs);
+    }
+    self.balance_state += 1;
+    self.root = self.createNode(lhs, rhs);
+
+    return leaf_node;
+}
+
 fn prependString(self: *Self, string: Node.String) *Node {
     var current = self.root;
     var parent: ?*Node = null;

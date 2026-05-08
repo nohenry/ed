@@ -28,6 +28,9 @@ key_dispatch_state: keymap.DispatchState = .{},
 
 matcher: ?ed.Rope.Matcher = null,
 
+last_find: ?u32 = null,
+last_find_kind: enum { to, till } = .to,
+
 pub fn init(io: std.Io, allocator: std.mem.Allocator) Self {
     return .{
         .io = io,
@@ -281,6 +284,119 @@ pub fn commandEnterInsertModeBelowLine(self: *Self, movement: ?Movement) void {
 
     self.view.cursor.head = line_range[1];
     self.view.cursor.tail = line_range[1];
+}
+
+pub fn commandReplace(self: *Self, character: u16) void {
+    const document = self.documents.getPtr(self.current_document) orelse return;
+    const ordered = self.view.cursor.getOrdered();
+    _ = document.rope.deleteRange(ordered[0], ordered[1] + 1) orelse return;
+    _ = document.rope.insertSplat(ordered[0], @truncate(character), ordered[1] - ordered[0] + 1);
+}
+
+pub fn commandFindNext(self: *Self, character: u32) void {
+    const document = self.documents.getPtr(self.current_document) orelse return;
+    const view_end = document.rope.add(
+        self.view.start_position,
+        ed.Rope.Coordinate{ .line = self.view.lines + 1, .column = 0 },
+        ed.Rope.Position,
+    );
+    var current_offset = self.view.cursor.head;
+    self.last_find = character;
+    self.last_find_kind = .to;
+    var node, var node_offset = document.rope.indexNode(self.view.cursor.head) orelse return;
+
+    var found = false;
+    while (current_offset < view_end) : (current_offset += 1) {
+        if (node.string.items[node_offset] == @as(u8, @truncate(character))) {
+            found = true;
+            break;
+        }
+        node, node_offset = node.nextNodeChar(node_offset) orelse break;
+    }
+
+    if (found) self.setCursor(current_offset);
+}
+
+pub fn commandFindPrevious(self: *Self, character: u32) void {
+    const document = self.documents.getPtr(self.current_document) orelse return;
+    var current_offset = self.view.cursor.head;
+    self.last_find = character;
+    self.last_find_kind = .to;
+    var node, var node_offset = document.rope.indexNode(self.view.cursor.head) orelse return;
+
+    var found = false;
+    while (current_offset >= self.view.start_position) : (current_offset -= 1) {
+        if (node.string.items[node_offset] == @as(u8, @truncate(character))) {
+            found = true;
+            break;
+        }
+        node, node_offset = node.previousNodeChar(node_offset) orelse break;
+    }
+
+    if (found) self.setCursor(current_offset);
+}
+
+pub fn commandFindTillNext(self: *Self, character: u32) void {
+    const document = self.documents.getPtr(self.current_document) orelse return;
+    const view_end = document.rope.add(
+        self.view.start_position,
+        ed.Rope.Coordinate{ .line = self.view.lines + 1, .column = 0 },
+        ed.Rope.Position,
+    );
+    var current_offset = self.view.cursor.head;
+    self.last_find = character;
+    self.last_find_kind = .till;
+    var node, var node_offset = document.rope.indexNode(self.view.cursor.head) orelse return;
+
+    var found = false;
+    while (current_offset < view_end) : (current_offset += 1) {
+        if (node.string.items[node_offset] == @as(u8, @truncate(character))) {
+            found = true;
+            break;
+        }
+        node, node_offset = node.nextNodeChar(node_offset) orelse break;
+    }
+
+    if (found and current_offset > 0) self.setCursor(current_offset - 1);
+}
+
+pub fn commandFindTillPrevious(self: *Self, character: u32) void {
+    const document = self.documents.getPtr(self.current_document) orelse return;
+    var current_offset = self.view.cursor.head;
+    self.last_find = character;
+    self.last_find_kind = .till;
+    var node, var node_offset = document.rope.indexNode(self.view.cursor.head) orelse return;
+
+    var found = false;
+    while (current_offset >= self.view.start_position) : (current_offset -= 1) {
+        if (node.string.items[node_offset] == @as(u8, @truncate(character))) {
+            found = true;
+            break;
+        }
+        node, node_offset = node.previousNodeChar(node_offset) orelse break;
+    }
+
+    if (found and current_offset + 1 < document.rope.len) self.setCursor(current_offset + 1);
+}
+
+pub fn commandFindAgainNext(self: *Self, movement: ?Movement) void {
+    _ = movement;
+    if (self.last_find) |character| {
+        switch (self.last_find_kind) {
+            .to => self.commandFindNext(character),
+            .till => self.commandFindTillNext(character),
+        }
+    }
+}
+
+pub fn commandFindAgainPrev(self: *Self, movement: ?Movement) void {
+    _ = movement;
+    if (self.last_find) |character| {
+        switch (self.last_find_kind) {
+            .to => self.commandFindPrevious(character),
+            .till => self.commandFindTillPrevious(character),
+        }
+    }
 }
 
 pub fn commandEnterVisualMode(self: *Self, movement: ?Movement) void {
