@@ -2,6 +2,7 @@ pub const Document = @import("Document.zig");
 pub const View = @import("View.zig");
 pub const Rope = @import("Rope.zig");
 pub const Editor = @import("Editor.zig");
+pub const Pattern = @import("pattern.zig").Pattern;
 
 pub const Renderer = @import("directx/directx.zig").Renderer;
 

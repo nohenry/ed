@@ -11,7 +11,11 @@ pub fn main(init: std.process.Init) !void {
 
     var writer = file.writer(init.io, &.{});
 
-    try generate(&writer.interface, @import("keymap_definition.zig").keymap_definition);
+    _ = try writer.interface.write("pub const DispatchResult = enum { not_mapped, waiting, dispatched_command };\n");
+    _ = try writer.interface.write("pub const DispatchState = struct { state: usize = 0 };\n");
+
+    try generate(&writer.interface, "dispatchNormalCommand", @import("keymap_definition.zig").normal_keymap_definition);
+    try generate(&writer.interface, "dispatchVisualCommand", @import("keymap_definition.zig").visual_keymap_definition);
 }
 
 const ctrl: u32 = 100000;
@@ -78,7 +82,7 @@ const KeyNode = struct {
     state: usize = 0,
 };
 
-fn generate(writer: *std.Io.Writer, comptime keymap: anytype) !void {
+fn generate(writer: *std.Io.Writer, dispatch_function_name: []const u8, comptime keymap: anytype) !void {
     var root = KeyNode{};
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     var allocator = arena.allocator();
@@ -131,9 +135,7 @@ fn generate(writer: *std.Io.Writer, comptime keymap: anytype) !void {
     }
 
     var state_var: usize = 1;
-    _ = try writer.write("pub const DispatchResult = enum { not_mapped, waiting, dispatched_command };\n");
-    _ = try writer.write("pub const DispatchState = struct { state: usize = 0 };\n");
-    _ = try writer.write("pub fn dispatchCommand(state: *DispatchState, key: u16, command_handlers: anytype) DispatchResult {\n");
+    try writer.print("pub fn {s}(state: *DispatchState, key: u16, command_handlers: anytype) DispatchResult {{\n", .{dispatch_function_name});
 
     for (0..1) |_| _ = try writer.write("    ");
     _ = try writer.write("switch (state.state) {\n");

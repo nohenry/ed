@@ -1,6 +1,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+const ed = @import("ed.zig");
+
 const builtin = @import("builtin");
 pub const Self = @This();
 
@@ -770,7 +772,56 @@ pub const Node = struct {
                 current = current.right.?;
             }
         }
+        if (current == self) return null;
         return current;
+    }
+
+    /// Get the next character and its node, relative to the given node, and character offset of that node.
+    /// node must be a leaf node.
+    /// node_offset must be a valid offset into the string of node.
+    pub fn nextNodeChar(node: *Node, node_offset: usize) ?struct { *Node, usize } {
+        std.debug.assert(node.isLeaf());
+        var current = node;
+        const utf8_len = std.unicode.utf8ByteSequenceLength(node.string.items[node_offset]) catch @panic("invalid utf8");
+        var current_node_offset = node_offset + utf8_len;
+        while (current_node_offset >= current.string.items.len) {
+            current_node_offset -= current.string.items.len;
+            current = current.nextLeaf() orelse return null;
+        }
+        return .{ current, current_node_offset };
+    }
+
+    /// Get the previous character and its node, relative to the given node, and character offset of that node.
+    /// node must be a leaf node.
+    /// node_offset must be a valid offset into the string of node.
+    pub fn previousNodeChar(node: *Node, node_offset: usize) ?struct { *Node, usize } {
+        std.debug.assert(node.isLeaf());
+        var current = node;
+
+        // const utf8_len = std.unicode.utf8ByteSequenceLength(node.string.items[node_offset]) catch @panic("invalid utf8");
+        var current_node_offset = node_offset;
+
+        // Handles the case we start at the beginning of a rope node. We got the previous node, if it exists.
+        while (current_node_offset == 0) {
+            current = current.previousLeaf() orelse return null;
+            std.debug.assert(current != node);
+            current_node_offset += current.string.items.len;
+        }
+        std.debug.assert(current_node_offset > 0);
+
+        current_node_offset -= 1;
+        // Handles the case where we're in the middle of a rope node, and we're not the start of a utf8 char.
+        // @NOTE: multi char utf8 characters should not span across node boundries.
+        while ((current.string.items[current_node_offset] & 0b11000000) == 0b10000000) {
+            // This loop implies an invalid utf8 sequence, because of the note above, but whatever, just go to the previous node.
+            while (current_node_offset == 0) {
+                current = current.previousLeaf() orelse return null;
+                current_node_offset += current.string.items.len;
+            }
+            current_node_offset -= 1;
+        }
+
+        return .{ current, current_node_offset };
     }
 
     pub fn getNonLeafs(self: *Node, scratch: std.mem.Allocator) std.ArrayList(*Node) {
@@ -1468,12 +1519,12 @@ fn appendString(self: *Self, string: Node.String) *Node {
     return new_right;
 }
 
+/// start is inclusive, end is exclusive
 pub fn deleteRange(self: *Self, start: usize, end: usize) ?struct { *Node, *Node } {
     if (self.root == null) return null;
     const lhs = self.split(self.root.?, start);
     const rhs = self.split(lhs[1], end - start);
     self.root = self.createNode(lhs[0], rhs[1]);
-    std.debug.print("delet range\n", .{});
 
     lhs[1].parent = null;
     rhs[0].parent = null;
@@ -1483,6 +1534,7 @@ pub fn deleteRange(self: *Self, start: usize, end: usize) ?struct { *Node, *Node
     while (iter_.next()) |leaf| {
         std.debug.print("leaf: {s}\n", .{leaf.string.items});
     }
+    self.len -= end - start;
     return .{ lhs[1], rhs[0] };
 }
 
@@ -1541,64 +1593,96 @@ pub fn dumpGraphImpl(node: *Node, id: usize, writer: *std.Io.Writer) !usize {
 }
 
 pub const Iterator = struct {
-    allocator: std.mem.Allocator,
-    stack: std.ArrayList(*Node),
+    node_iter: NodeIterator = .{},
+    current_node: ?*Node = null,
     index: usize = 0,
 
-    pub fn next(self: *Iterator) ?u32 {
-        const current = self.stack.getLastOrNull() orelse return null;
-
-        if (self.index >= current.string.items.len) {
-            var left = self.stack.pop() orelse return null;
-
-            if (self.stack.pop()) |parent| {
-                if (parent.right) |right| {
-                    self.stack.append(self.allocator, right) catch @panic("OOM");
-
-                    var next_left = right.left;
-                    left = right;
-                    while (next_left != null) {
-                        self.stack.append(self.allocator, next_left.?) catch @panic("OOM");
-                        left = next_left.?;
-                        next_left = next_left.?.left;
-                    }
-                }
-            } else return null;
-
-            const length = std.unicode.utf8ByteSequenceLength(left.string.items[0]) catch @panic("invalid utf8");
-            const codepoint = std.unicode.utf8Decode(left.string.items[0..length]) catch @panic("invalid utf8");
-            defer self.index = length;
-
-            return @as(u32, codepoint);
-        } else {
-            const length = std.unicode.utf8ByteSequenceLength(current.string.items[self.index]) catch @panic("invlaid utf8");
-            const codepoint = std.unicode.utf8Decode(current.string.items[self.index .. self.index + length]) catch @panic("invalid utf8");
-            defer self.index += length;
-
-            return @as(u32, codepoint);
-        }
+    pub inline fn save(self: Iterator) Iterator {
+        return self;
     }
 
-    pub fn deinit(self: *Iterator) void {
-        self.stack.deinit(self.allocator);
+    pub inline fn restore(self: *Iterator, saved: Iterator) void {
+        self.* = saved;
+    }
+
+    pub fn nextByte(self: *Iterator) ?u8 {
+        while (self.current_node != null and self.index >= self.current_node.?.string.items.len) {
+            self.current_node = self.node_iter.next();
+            self.index = 0;
+        }
+        const current = self.current_node orelse return null;
+
+        defer self.index += 1;
+
+        return current.string.items[self.index];
+    }
+
+    pub fn prevByte(self: *Iterator) ?u8 {
+        while (self.current_node != null and self.index == 0) {
+            self.current_node = self.node_iter.prev();
+            if (self.current_node) |cn| self.index = cn.string.items.len - 1;
+        }
+        const current = self.current_node orelse return null;
+
+        defer self.index -= 1;
+
+        return current.string.items[self.index];
+    }
+
+    pub fn next(self: *Iterator) ?u32 {
+        while (self.current_node != null and self.index >= self.current_node.?.string.items.len) {
+            self.current_node = self.node_iter.next();
+            self.index = 0;
+        }
+        const current = self.current_node orelse return null;
+
+        const length = std.unicode.utf8ByteSequenceLength(current.string.items[self.index]) catch @panic("invlaid utf8");
+        const codepoint = std.unicode.utf8Decode(current.string.items[self.index .. self.index + length]) catch @panic("invalid utf8");
+        defer self.index += length;
+
+        return @as(u32, codepoint);
+    }
+
+    pub fn prev(self: *Iterator) ?u32 {
+        const current = self.current_node orelse return null;
+        const new_node, const new_index = current.previousNodeChar(self.index) orelse .{ null, 0 };
+
+        const length = std.unicode.utf8ByteSequenceLength(current.string.items[self.index]) catch @panic("invlaid utf8");
+        const codepoint = std.unicode.utf8Decode(current.string.items[self.index .. self.index + length]) catch @panic("invalid utf8");
+        defer {
+            self.current_node = new_node;
+            self.index = new_index;
+        }
+
+        return @as(u32, codepoint);
     }
 };
 
-pub inline fn iter(self: *Self, allocator: std.mem.Allocator) Iterator {
-    return self.iterNode(self.root, allocator);
+pub inline fn iter(self: *Self) Iterator {
+    return self.iterNode(self.root);
 }
 
-pub fn iterNode(self: *Self, node: ?*Node, allocator: std.mem.Allocator) Iterator {
-    _ = self;
-    var current = node;
+pub fn iterNode(self: *Self, node: ?*Node) Iterator {
+    var node_iter = self.nodeIterNode(node);
+    const start_node = node_iter.next();
+    return .{
+        .node_iter = node_iter,
+        .current_node = start_node,
+    };
+}
 
-    var stack = std.ArrayList(*Node).empty;
-    while (current != null) {
-        stack.append(allocator, current.?) catch @panic("OOM");
-        current = current.?.left;
-    }
-
-    return .{ .allocator = allocator, .stack = stack };
+pub fn iterStartingFrom(self: *Self, position: Position) Iterator {
+    var node_iter = self.nodeIter();
+    const start_node, const start_offset = self.indexNode(position) orelse return .{
+        .node_iter = .{ .root = null, .current = null },
+        .current_node = null,
+    };
+    node_iter.current = start_node.nextLeaf();
+    return .{
+        .node_iter = node_iter,
+        .current_node = start_node,
+        .index = start_offset,
+    };
 }
 
 pub const Utf16Iterator = struct {
@@ -1633,15 +1717,14 @@ pub fn iterUtf16(self: *Self, output_buffer: *[2]u16) Utf16Iterator {
 }
 
 pub fn iterUtf16StartingFrom(self: *Self, output_buffer: *[2]u16, position: Position) Utf16Iterator {
-    var node_iter = self.nodeIter();
     const start_node, const start_offset = self.indexNode(position) orelse return .{
         .node_iter = .{ .root = null, .current = null },
         .current_node = null,
         .output_buffer = output_buffer,
     };
-    node_iter.current = start_node.nextLeaf();
+
     return .{
-        .node_iter = node_iter,
+        .node_iter = self.nodeIterLeafNode(start_node.nextLeaf()),
         .current_node = start_node,
         .output_buffer = output_buffer,
         .index = start_offset,
@@ -1649,8 +1732,8 @@ pub fn iterUtf16StartingFrom(self: *Self, output_buffer: *[2]u16, position: Posi
 }
 
 pub const NodeIterator = struct {
-    root: ?*Node,
-    current: ?*Node,
+    root: ?*Node = null,
+    current: ?*Node = null,
 
     pub fn next(self: *NodeIterator) ?*Node {
         const result = self.current;
@@ -1659,10 +1742,26 @@ pub const NodeIterator = struct {
         }
         return result;
     }
+
+    pub fn prev(self: *NodeIterator) ?*Node {
+        const result = self.current;
+        if (self.current) |c| {
+            self.current = c.previousLeaf();
+        }
+        return result;
+    }
 };
 
 pub inline fn nodeIter(self: *Self) NodeIterator {
     return self.nodeIterNode(self.root);
+}
+
+pub inline fn nodeIterLeafNode(self: *Self, leaf: ?*Node) NodeIterator {
+    std.debug.assert(leaf == null or leaf.?.isLeaf());
+    return .{
+        .root = self.root,
+        .current = leaf,
+    };
 }
 
 pub fn nodeIterNode(self: *Self, root_node: ?*Node) NodeIterator {
@@ -1673,6 +1772,49 @@ pub fn nodeIterNode(self: *Self, root_node: ?*Node) NodeIterator {
         current = c.left;
     }
     return .{ .root = self.root, .current = current };
+}
+
+pub const RangeIterator = struct {
+    node_iter: NodeIterator,
+    node_offset: usize, // @Cleanup: This is only possibly non zero for the first node...
+    position: usize,
+    end_position: usize,
+
+    pub fn next(self: *RangeIterator) ?[]const u8 {
+        const current = self.node_iter.next() orelse return null;
+        if (self.position >= self.end_position) return null;
+
+        const end = @min(self.node_offset + self.end_position - self.position, current.string.items.len);
+        const result = current.string.items[self.node_offset..end];
+        self.position += end - self.node_offset;
+        self.node_offset = 0;
+        return result;
+    }
+};
+
+pub fn rangeIter(self: *Self, start: usize, end: usize) RangeIterator {
+    const start_node, const start_offset = self.indexNode(start) orelse return .{
+        .node_iter = .{},
+        .node_offset = 0,
+        .position = 0,
+        .end_position = 0,
+    };
+
+    return .{
+        .node_iter = self.nodeIterLeafNode(start_node),
+        .node_offset = start_offset,
+        .position = start,
+        .end_position = end,
+    };
+}
+
+pub fn toOwnedSlice(self: *Self, start: usize, end: usize, allocator: std.mem.Allocator) []const u8 {
+    var buffer = std.Io.Writer.Allocating.initCapacity(allocator, end - start) catch @panic("OOM");
+    var range_iter = self.rangeIter(start, end);
+    while (range_iter.next()) |slice| {
+        buffer.writer.writeAll(slice) catch @panic("OOM");
+    }
+    return buffer.writer.buffer;
 }
 
 /// Returns the node, and the relative string offset into the node
@@ -1697,55 +1839,6 @@ pub fn indexNode(self: *Self, index: usize) ?struct { *Node, usize } {
     return if (current) |c| .{ c, current_index } else null;
 }
 
-/// Get the next character and its node, relative to the given node, and character offset of that node.
-/// node must be a leaf node.
-/// node_offset must be a valid offset into the string of node.
-pub fn nextNodeChar(self: *Self, node: *Node, node_offset: usize) ?struct { *Node, usize } {
-    _ = self;
-    std.debug.assert(node.isLeaf());
-    var current = node;
-    const utf8_len = std.unicode.utf8ByteSequenceLength(node.string.items[node_offset]) catch @panic("invalid utf8");
-    var current_node_offset = node_offset + utf8_len;
-    while (current_node_offset >= current.string.items.len) {
-        current_node_offset -= current.string.items.len;
-        current = current.nextLeaf() orelse return null;
-    }
-    return .{ current, current_node_offset };
-}
-
-/// Get the previous character and its node, relative to the given node, and character offset of that node.
-/// node must be a leaf node.
-/// node_offset must be a valid offset into the string of node.
-pub fn previousNodeChar(self: *Self, node: *Node, node_offset: usize) ?struct { *Node, usize } {
-    _ = self;
-    std.debug.assert(node.isLeaf());
-    var current = node;
-
-    // const utf8_len = std.unicode.utf8ByteSequenceLength(node.string.items[node_offset]) catch @panic("invalid utf8");
-    var current_node_offset = node_offset;
-
-    // Handles the case we start at the beginning of a rope node. We got the previous node, if it exists.
-    while (current_node_offset == 0) {
-        current = current.previousLeaf() orelse return null;
-        current_node_offset += current.string.items.len;
-    }
-    std.debug.assert(current_node_offset > 0);
-
-    current_node_offset -= 1;
-    // Handles the case where we're in the middle of a rope node, and we're not the start of a utf8 char.
-    // @NOTE: multi char utf8 characters should not span across node boundries.
-    while ((current.string.items[current_node_offset] & 0b11000000) == 0b10000000) {
-        // This loop implies an invalid utf8 sequence, because of the note above, but whatever, just go to the previous node.
-        while (current_node_offset == 0) {
-            current = current.previousLeaf() orelse return null;
-            current_node_offset += current.string.items.len;
-        }
-        current_node_offset -= 1;
-    }
-
-    return .{ current, current_node_offset };
-}
-
 /// Anchor must be at the start of a line
 /// Get the line and column at position
 pub fn lineColumnFromRelativePosition(self: *Self, anchor: usize, position: usize) ?Coordinate {
@@ -1766,7 +1859,7 @@ pub fn lineColumnFromRelativePosition(self: *Self, anchor: usize, position: usiz
                 column += 1;
             },
         }
-        current_node, current_node_offset = self.nextNodeChar(current_node, current_node_offset) orelse break;
+        current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse break;
     }
 
     return .{ .line = line, .column = column };
@@ -1791,7 +1884,7 @@ pub fn addLineOffsetToPosition(self: *Self, position: usize, line_offset: u32) v
                 column += 1;
             },
         }
-        current_node, current_node_offset = self.nextNodeChar(current_node, current_node_offset) orelse break;
+        current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse break;
     }
 
     return .{ column, line };
@@ -1824,7 +1917,7 @@ pub fn add(self: *Self, a: anytype, b: anytype, comptime T: type) T {
                         column += 1;
                     },
                 }
-                current_node, current_node_offset = self.nextNodeChar(current_node, current_node_offset) orelse break;
+                current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse break;
             }
 
             return .{ .line = line, .column = column };
@@ -1856,7 +1949,7 @@ pub fn add(self: *Self, a: anytype, b: anytype, comptime T: type) T {
                     column += 1;
                 },
             }
-            current_node, current_node_offset = self.nextNodeChar(current_node, current_node_offset) orelse break;
+            current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse break;
         }
 
         while (current_offset < b and current_offset < self.len) : (current_offset += 1) {
@@ -1870,7 +1963,7 @@ pub fn add(self: *Self, a: anytype, b: anytype, comptime T: type) T {
                     column += 1;
                 },
             }
-            current_node, current_node_offset = self.nextNodeChar(current_node, current_node_offset) orelse break;
+            current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse break;
         }
 
         if (T == Position) {
@@ -1902,7 +1995,7 @@ pub fn add(self: *Self, a: anytype, b: anytype, comptime T: type) T {
                     column += 1;
                 },
             }
-            current_node, current_node_offset = self.nextNodeChar(current_node, current_node_offset) orelse break;
+            current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse break;
         }
 
         if (current_offset + 1 >= self.len and line != b.line) {
@@ -1942,7 +2035,7 @@ pub fn sub(self: *Self, a: anytype, b: anytype, comptime T: type) T {
                         column += 1;
                     },
                 }
-                current_node, current_node_offset = self.previousNodeChar(current_node, current_node_offset) orelse break;
+                current_node, current_node_offset = current_node.previousNodeChar(current_node_offset) orelse break;
             }
 
             return .{ .line = line, .column = column };
@@ -1967,7 +2060,7 @@ pub fn sub(self: *Self, a: anytype, b: anytype, comptime T: type) T {
                     column -= 1;
                 },
             }
-            current_node, current_node_offset = self.previousNodeChar(current_node, current_node_offset) orelse break;
+            current_node, current_node_offset = current_node.previousNodeChar(current_node_offset) orelse break;
         }
 
         if (T == Position) {
@@ -1977,7 +2070,7 @@ pub fn sub(self: *Self, a: anytype, b: anytype, comptime T: type) T {
         } else @compileError("Unsupported result type");
     } else if (Ta == Position and Tb == Coordinate) {
         var current_node, var current_node_offset = self.indexNode(a).?;
-        std.debug.assert(b.column == 0); // @Cleanup: Not sure how to handle this yet
+        // std.debug.assert(b.column == 0); // @Cleanup: Not sure how to handle this yet
 
         var current_offset = a;
         var line: u32 = 0;
@@ -1999,7 +2092,7 @@ pub fn sub(self: *Self, a: anytype, b: anytype, comptime T: type) T {
                 },
                 else => {},
             }
-            current_node, current_node_offset = self.previousNodeChar(current_node, current_node_offset) orelse break;
+            current_node, current_node_offset = current_node.previousNodeChar(current_node_offset) orelse break;
         }
 
         if (T == Position) {
@@ -2021,7 +2114,7 @@ pub fn getLineRange(self: *Self, position: usize) ?struct { usize, usize } {
     // handles the case we start on newline
     if (current_node.string.items[current_node_offset] == '\n') {
         line_start -|= 1;
-        current_node, current_node_offset = self.previousNodeChar(current_node, current_node_offset) orelse .{ current_node, 0 };
+        current_node, current_node_offset = current_node.previousNodeChar(current_node_offset) orelse .{ current_node, 0 };
     }
 
     while (line_start > 0) : (line_start -= 1) {
@@ -2033,7 +2126,7 @@ pub fn getLineRange(self: *Self, position: usize) ?struct { usize, usize } {
             else => {},
         }
 
-        current_node, current_node_offset = self.previousNodeChar(current_node, current_node_offset) orelse break;
+        current_node, current_node_offset = current_node.previousNodeChar(current_node_offset) orelse break;
     }
 
     current_node, current_node_offset = self.indexNode(position).?;
@@ -2045,7 +2138,7 @@ pub fn getLineRange(self: *Self, position: usize) ?struct { usize, usize } {
             },
             else => {},
         }
-        current_node, current_node_offset = self.nextNodeChar(current_node, current_node_offset) orelse break;
+        current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse break;
     }
 
     return .{ line_start, line_end + 1 };
@@ -2074,7 +2167,7 @@ pub fn getNextLineRange(self: *Self, position: usize) ?struct { usize, usize } {
         // We shouldn't be in the middle of a utf8 multi byte sequence, in theory.
         std.debug.assert((current_node.string.items[current_node_offset] & 0b11000000) != 0b10000000);
         // return null if reached beginning of file, since there is no more lines.
-        current_node, current_node_offset = self.nextNodeChar(current_node, current_node_offset) orelse break;
+        current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse break;
     }
 
     return .{ last_line_start, current_offset + 1 };
@@ -2104,7 +2197,7 @@ pub fn getPreviousLineRange(self: *Self, position: usize) ?struct { usize, usize
         // We shouldn't be in the middle of a utf8 multi byte sequence, in theory.
         std.debug.assert((current_node.string.items[current_node_offset] & 0b11000000) != 0b10000000);
         // return null if reached beginning of file, since there is no more lines.
-        current_node, current_node_offset = self.previousNodeChar(current_node, current_node_offset) orelse break;
+        current_node, current_node_offset = current_node.previousNodeChar(current_node_offset) orelse break;
     }
 
     return .{ current_offset, last_line_end + 1 };
@@ -2133,7 +2226,7 @@ pub fn getNextWord(self: *Self, position: usize) usize {
             },
         }
 
-        current_node, current_node_offset = self.nextNodeChar(current_node, current_node_offset) orelse break;
+        current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse break;
     }
 
     return current_offset - position;
@@ -2172,7 +2265,7 @@ pub fn getNextWordEnd(self: *Self, position: usize) usize {
             },
         }
 
-        current_node, current_node_offset = self.nextNodeChar(current_node, current_node_offset) orelse break;
+        current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse break;
     }
 
     return current_offset - position;
@@ -2211,10 +2304,107 @@ pub fn getPreviousWord(self: *Self, position: usize) usize {
             },
         }
 
-        current_node, current_node_offset = self.previousNodeChar(current_node, current_node_offset) orelse break;
+        current_node, current_node_offset = current_node.previousNodeChar(current_node_offset) orelse break;
     }
 
     return position - current_offset;
+}
+
+pub const Matcher = struct {
+    iterator: Iterator = .{},
+    saved_iterator: Iterator = .{},
+    pattern: *const ed.Pattern = undefined,
+    start: usize = 0,
+    end: usize = 0,
+    // position: usize = 0,
+    // position_opposite: usize = 0,
+    dir: enum { next, prev } = .next,
+
+    pub const empty = Matcher{};
+
+    pub fn wrapNext(self: *Matcher, rope: *Self) void {
+        self.iterator = rope.iter();
+        self.start = 0;
+        self.end = 0;
+    }
+
+    pub fn wrapPrev(self: *Matcher, rope: *Self) void {
+        self.iterator = rope.iterStartingFrom(rope.len -| 1);
+        self.start = rope.len -| 1;
+        self.end = rope.len -| 1;
+    }
+
+    pub fn next(self: *Matcher) ?ed.View.Selection {
+        if (self.dir != .next) {
+            for (self.start..self.end) |_| {
+                _ = self.iterator.nextByte();
+            }
+        }
+        self.dir = .next;
+
+        self.start = self.end;
+
+        var matched, var match_length = self.pattern.matchesWithIterator(Iterator.nextByte, &self.iterator);
+        while (!matched) {
+            const t = self.iterator.next();
+            if (t == null) return null;
+            self.start += std.unicode.utf8CodepointSequenceLength(@truncate(t.?)) catch @panic("Invalid utf8");
+            matched, match_length = self.pattern.matchesWithIterator(Iterator.nextByte, &self.iterator);
+        }
+
+        self.end = self.start + match_length;
+
+        return .{ .head = self.end -| 1, .tail = self.start };
+    }
+
+    pub fn prev(self: *Matcher) ?ed.View.Selection {
+        if (self.dir != .prev) {
+            for (self.start..self.end) |_| {
+                _ = self.iterator.prevByte();
+            }
+        }
+        self.dir = .prev;
+
+        if (self.start == 0) return null;
+
+        self.start -= 1;
+        self.end -= 1;
+        _ = self.iterator.prevByte();
+
+        var saved = self.iterator.save();
+        var matched, var match_length = self.pattern.matchesWithIterator(Iterator.nextByte, &self.iterator);
+        self.iterator.restore(saved);
+
+        while (!matched) {
+            const t = self.iterator.prev();
+            if (t == null) return null;
+            self.start -= std.unicode.utf8CodepointSequenceLength(@truncate(t.?)) catch @panic("Invalid utf8");
+
+            saved = self.iterator.save();
+            matched, match_length = self.pattern.matchesWithIterator(Iterator.nextByte, &self.iterator);
+            self.iterator.restore(saved);
+        }
+
+        self.end = self.start + match_length;
+
+        return .{ .head = self.end -| 1, .tail = self.start };
+    }
+};
+
+pub fn match(self: *Self, pattern: *const ed.Pattern) Matcher {
+    return .{
+        .iterator = self.iter(),
+        .pattern = pattern,
+    };
+}
+
+pub fn matchStartingFrom(self: *Self, pattern: *const ed.Pattern, position: usize) Matcher {
+    return .{
+        .iterator = self.iterStartingFrom(position),
+        .pattern = pattern,
+        .start = position,
+        .end = position,
+    };
 }
 
 test "rope test" {

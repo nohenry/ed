@@ -7,6 +7,7 @@ const win32 = @import("win32");
 
 const directx = @import("directx/directx.zig");
 const ed = @import("ed.zig");
+const pat = @import("pattern.zig");
 
 comptime {
     _ = ed;
@@ -43,7 +44,8 @@ fn window_proc(hwnd: win32.HWND, message: win32.UINT, wparam: win32.WPARAM, lpar
                         .char = 0,
                         .modifers = .{
                             .ctrl = if (@as(u16, @bitCast(win32.GetKeyState(win32.VK_CONTROL))) & 0x8000 > 0) 1 else 0,
-                            .shift = if (@as(u16, @bitCast(win32.GetKeyState(win32.VK_SHIFT))) & 0x8000 > 0) 1 else 0,
+                            // .shift = if (@as(u16, @bitCast(win32.GetKeyState(win32.VK_SHIFT))) & 0x8000 > 0) 1 else 0,
+                            .shift = 0,
                             .alt = if (@as(u16, @bitCast(win32.GetKeyState(win32.VK_MENU))) & 0x8000 > 0) 1 else 0,
                         },
                     },
@@ -52,7 +54,7 @@ fn window_proc(hwnd: win32.HWND, message: win32.UINT, wparam: win32.WPARAM, lpar
                     var keystate: [256]u8 = undefined;
                     _ = win32.GetKeyboardState(&keystate[0]);
                     keystate[win32.VK_CONTROL] = 0;
-                    keystate[win32.VK_SHIFT] = 0;
+                    // keystate[win32.VK_SHIFT] = 0;
                     keystate[win32.VK_MENU] = 0;
 
                     const scancode = (lparam >> 16) & 0xFF;
@@ -66,7 +68,8 @@ fn window_proc(hwnd: win32.HWND, message: win32.UINT, wparam: win32.WPARAM, lpar
                                 .char = char,
                                 .modifers = .{
                                     .ctrl = if (@as(u16, @bitCast(win32.GetKeyState(win32.VK_CONTROL))) & 0x8000 > 0) 1 else 0,
-                                    .shift = if (@as(u16, @bitCast(win32.GetKeyState(win32.VK_SHIFT))) & 0x8000 > 0) 1 else 0,
+                                    //.shift = if (@as(u16, @bitCast(win32.GetKeyState(win32.VK_SHIFT))) & 0x8000 > 0) 1 else 0,
+                                    .shift = 0,
                                     .alt = if (@as(u16, @bitCast(win32.GetKeyState(win32.VK_MENU))) & 0x8000 > 0) 1 else 0,
                                 },
                             },
@@ -192,17 +195,27 @@ pub fn main2(init: std.process.Init) !void {
     _ = rope.insertString(7, "1234");
     const bruhv_inser_point = rope.insertString(18, "bruhv");
     try bruhv_inser_point.appendSlice(arena.allocator(), "umm ok");
-    // rope.insertString(13, "im tthirten");
+    _ = rope.insertString(13, "im tthirten");
 
     // rope.rebalance(scratch.allocator());
     // rope.insertString(0, "foobar");
     // rope.insertString(rope.len, "fricku");
 
-    var i = rope.iter(std.heap.page_allocator);
-    while (i.next()) |f| {
-        std.debug.print("char: {u}\n", .{@as(u21, @truncate(f))});
+    const pattern = ed.Pattern.parseTokenBased("the", std.heap.page_allocator);
+    var matcher = rope.matchStartingFrom(pattern, 10);
+    while (matcher.prev()) |s| {
+        std.debug.print("matched: {}\n", .{s});
     }
-    i.deinit();
+
+    var range_iter = rope.rangeIter(4, 14);
+    while (range_iter.next()) |slice| {
+        std.debug.print("Range: '{s}'\n", .{slice});
+    }
+
+    // var i = rope.iter();
+    // while (i.next()) |f| {
+    //     std.debug.print("char: {u}\n", .{@as(u21, @truncate(f))});
+    // }
 
     var file = try std.Io.Dir.createFile(std.Io.Dir.cwd(), init.io, "output.dot", .{});
     var buffer: [4096]u8 = undefined;
@@ -218,6 +231,23 @@ pub fn main(init: std.process.Init) !void {
     application.initPinned(init.io, init.gpa);
 
     application.run();
+}
+
+pub fn main3() void {
+    var allocator = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    const pattern = "foobar";
+    const pattern1 = "foobar+";
+    const pattern2 = "foobar*";
+    const pattern3 = "bar+(  baz)*";
+    const pattern4 = "foo (baz|bar)+b";
+    _ = pattern;
+    _ = pattern1;
+    _ = pattern2;
+    _ = pattern3;
+    // _ = pattern4;
+    const patternp = pat.Pattern.parseTokenBased(pattern4, allocator.allocator());
+    std.debug.print("{f}\n", .{patternp});
+    std.debug.print("matches {}\n", .{patternp.matches("foo bazbarbazbazbarb")});
 }
 
 test "simple test" {

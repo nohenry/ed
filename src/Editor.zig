@@ -10,6 +10,7 @@ pub const Self = @This();
 
 io: std.Io,
 allocator: std.mem.Allocator,
+scratch: std.heap.ArenaAllocator,
 documents: std.AutoHashMapUnmanaged(ed.Document.Id, ed.Document) = .empty,
 next_document_id: ed.Document.Id = .{ .value = 1 },
 current_document: ed.Document.Id = .nil,
@@ -18,16 +19,20 @@ view: ed.View = .{},
 mode: enum {
     insert,
     normal,
+    visual,
 } = .normal,
 
 saved_insert_node: ?*ed.Rope.Node = null,
 
 key_dispatch_state: keymap.DispatchState = .{},
 
+matcher: ?ed.Rope.Matcher = null,
+
 pub fn init(io: std.Io, allocator: std.mem.Allocator) Self {
     return .{
         .io = io,
         .allocator = allocator,
+        .scratch = .init(std.heap.page_allocator),
     };
 }
 
@@ -54,6 +59,7 @@ pub fn handleEvent(self: *Self, event: ed.Event) void {
             switch (self.mode) {
                 .insert => self.handleInsertModeKeydown(event),
                 .normal => self.handleNormalModeKeydown(event),
+                .visual => self.handleVisualModeKeydown(event),
             }
         },
     }
@@ -65,7 +71,7 @@ pub fn handleInsertModeKeydown(self: *Self, event: ed.Event) void {
     switch (data.key) {
         .char => {
             const node = self.saved_insert_node orelse blk: {
-                const new_node = document.rope.insertString(self.view.cursor_position, "");
+                const new_node = document.rope.insertString(self.view.cursor.head, "");
                 self.saved_insert_node = new_node;
                 break :blk new_node;
             };
@@ -73,40 +79,162 @@ pub fn handleInsertModeKeydown(self: *Self, event: ed.Event) void {
             var out: [4]u8 = undefined;
             const utf8_len = std.unicode.utf8Encode(@truncate(data.char), &out) catch @panic("invlaid utf8");
             node.appendSlice(self.allocator, out[0..utf8_len]) catch @panic("OOM");
-            self.view.cursor_position += utf8_len;
+            self.view.cursor.head += utf8_len;
+            self.view.cursor.tail += utf8_len;
             self.view.max_column += utf8_len;
         },
         .escape => {
+            self.key_dispatch_state = .{};
             self.mode = .normal;
             self.saved_insert_node = null;
-            ed.Rope.dumpNodeToFile(document.rope.root.?, "out.dot") catch @panic("fjklsdjfsd");
         },
     }
 }
 
 pub fn handleNormalModeKeydown(self: *Self, event: ed.Event) void {
-    const document = self.documents.getPtr(self.current_document) orelse return;
-    // _ = document;
     const data = event.key_down;
 
-    if (data.key == .char and (data.char & 0x7F) == data.char) {
-        _ = keymap.dispatchCommand(&self.key_dispatch_state, (@as(u16, @as(u3, @bitCast(data.modifers))) << 7) | @as(u7, @truncate(data.char)), self);
+    switch (data.key) {
+        .char => {
+            if (data.key == .char and (data.char & 0x7F) == data.char) {
+                _ = keymap.dispatchNormalCommand(&self.key_dispatch_state, (@as(u16, @as(u3, @bitCast(data.modifers))) << 7) | @as(u7, @truncate(data.char)), self);
+            }
+        },
+        .escape => {
+            self.key_dispatch_state = .{};
+            self.view.cursor.tail = self.view.cursor.head;
+            self.mode = .normal;
+        },
     }
-    ed.Rope.dumpNodeToFile(document.rope.root.?, "out.dot") catch @panic("fjklsdjfsd");
 }
+
+pub fn handleVisualModeKeydown(self: *Self, event: ed.Event) void {
+    const data = event.key_down;
+
+    switch (data.key) {
+        .char => {
+            if (data.key == .char and (data.char & 0x7F) == data.char) {
+                _ = keymap.dispatchVisualCommand(&self.key_dispatch_state, (@as(u16, @as(u3, @bitCast(data.modifers))) << 7) | @as(u7, @truncate(data.char)), self);
+            }
+        },
+        .escape => {
+            self.key_dispatch_state = .{};
+            self.view.cursor.tail = self.view.cursor.head;
+            self.mode = .normal;
+        },
+    }
+}
+
+pub fn setCursor(self: *Self, position: usize) void {
+    switch (self.mode) {
+        .normal, .insert => {
+            self.view.cursor.head = position;
+            self.view.cursor.tail = position;
+        },
+        .visual => {
+            self.view.cursor.head = position;
+        },
+    }
+}
+
+pub fn moveCursorUp(self: *Self, line_count: u32, comptime move_cursor: bool) void {
+    var coords = self.calculateCursorViewCoords();
+    coords.column = @truncate(self.view.max_column);
+
+    const document = self.documents.getPtr(self.current_document) orelse return;
+    const new_start_position = document.rope.sub(
+        self.view.start_position,
+        ed.Rope.Coordinate{ .line = line_count, .column = 0 },
+        ed.Rope.Position,
+    );
+
+    self.view.start_position = new_start_position;
+
+    if (move_cursor) {
+        if (new_start_position == 0) {
+            coords.line -|= line_count;
+            self.setCursor(document.rope.add(
+                new_start_position,
+                coords,
+                ed.Rope.Position,
+            ));
+        } else {
+            self.setCursor(document.rope.add(
+                new_start_position,
+                coords,
+                ed.Rope.Position,
+            ));
+        }
+    }
+}
+
+pub fn moveCursorDown(self: *Self, line_count: u32, comptime move_cursor: bool) void {
+    var coords = self.calculateCursorViewCoords();
+    coords.column = @truncate(self.view.max_column);
+
+    const document = self.documents.getPtr(self.current_document) orelse return;
+    const new_start_position = document.rope.add(
+        self.view.start_position,
+        ed.Rope.Coordinate{ .line = line_count, .column = 0 },
+        ed.Rope.Position,
+    );
+
+    const max_pos = document.rope.sub(
+        document.rope.len - 1,
+        ed.Rope.Coordinate{ .line = self.view.lines - 2, .column = 0 },
+        ed.Rope.Position,
+    );
+    self.view.start_position = @min(new_start_position, max_pos);
+
+    if (move_cursor) {
+        self.setCursor(document.rope.add(
+            new_start_position,
+            coords,
+            ed.Rope.Position,
+        ));
+    }
+}
+
+pub fn adjustViewToCursorPosition(self: *Self, cursor_position: usize) void {
+    const document = self.documents.getPtr(self.current_document) orelse return;
+
+    var old_coords = self.calculateCursorViewCoords();
+    old_coords.column = 0;
+
+    const new_coords = document.rope.lineColumnFromRelativePosition(self.view.start_position, cursor_position) orelse return;
+    if (cursor_position >= self.view.start_position and new_coords.line + 5 <= self.view.lines) return;
+
+    const new_start_position = document.rope.sub(cursor_position, old_coords, ed.Rope.Position);
+    const line_range = document.rope.getLineRange(new_start_position) orelse return;
+
+    const max_pos = document.rope.sub(
+        document.rope.len - 1,
+        ed.Rope.Coordinate{ .line = self.view.lines - 2, .column = 0 },
+        ed.Rope.Position,
+    );
+
+    self.view.start_position = @min(line_range[0], max_pos);
+}
+
+// ********************* NORMAL COMMANDS *********************
 
 pub fn commandEnterInsertMode(self: *Self, movement: ?Movement) void {
     _ = movement;
     self.mode = .insert;
 }
 
+pub fn commandEnterVisualMode(self: *Self, movement: ?Movement) void {
+    _ = movement;
+    self.mode = .visual;
+}
+
 pub fn commandDeleteMovement(self: *Self, movement: ?Movement) void {
     const movement_result = self.calculateKeyMovement(movement.?, .delete) orelse return;
     const document = self.documents.getPtr(self.current_document) orelse return;
-    _ = document.rope.deleteRange(movement_result.range_start, movement_result.range_end);
+    _ = document.rope.deleteRange(movement_result.selection.tail, movement_result.selection.head);
 
     if (movement_result.linewise) {
-        self.view.cursor_position = movement_result.cursor_position;
+        self.setCursor(movement_result.cursor_position);
     }
 }
 
@@ -120,84 +248,123 @@ pub fn commandMoveUpHalfView(self: *Self, movement: ?Movement) void {
     _ = movement;
 
     const line_difference = self.view.lines / 2;
-    var coords = self.calculateCursorViewCoords();
-    coords.column = @truncate(self.view.max_column);
-
-    const document = self.documents.getPtr(self.current_document) orelse return;
-    const new_start_position = document.rope.sub(
-        self.view.start_position,
-        ed.Rope.Coordinate{ .line = line_difference, .column = 0 },
-        ed.Rope.Position,
-    );
-
-    self.view.start_position = new_start_position;
-
-    if (new_start_position == 0) {
-        coords.line -|= line_difference;
-        self.view.cursor_position = document.rope.add(
-            new_start_position,
-            coords,
-            ed.Rope.Position,
-        );
-    } else {
-        self.view.cursor_position = document.rope.add(
-            new_start_position,
-            coords,
-            ed.Rope.Position,
-        );
-    }
+    self.moveCursorUp(line_difference, true);
 }
 
 pub fn commandMoveDownHalfView(self: *Self, movement: ?Movement) void {
     _ = movement;
 
     const line_difference = self.view.lines / 2;
-    var coords = self.calculateCursorViewCoords();
-    coords.column = @truncate(self.view.max_column);
-
-    const document = self.documents.getPtr(self.current_document) orelse return;
-    const new_start_position = document.rope.add(
-        self.view.start_position,
-        ed.Rope.Coordinate{ .line = line_difference, .column = 0 },
-        ed.Rope.Position,
-    );
-
-    const max_pos = document.rope.sub(
-        document.rope.len - 1,
-        ed.Rope.Coordinate{ .line = self.view.lines - 1, .column = 0 },
-        ed.Rope.Position,
-    );
-    self.view.start_position = @min(new_start_position, max_pos);
-
-    self.view.cursor_position = document.rope.add(
-        new_start_position,
-        coords,
-        ed.Rope.Position,
-    );
+    self.moveCursorDown(line_difference, true);
 }
 
 pub fn commandMove(self: *Self, movement: ?Movement) void {
     const movement_result = self.calculateKeyMovement(movement.?, .move);
     if (movement_result) |move| {
-        self.view.cursor_position = move.cursor_position;
+        self.setCursor(move.selection.head);
         self.view.max_column = move.max_column;
 
         const document = self.documents.getPtr(self.current_document) orelse return;
 
         // Cursor going before the start of the view is less expensive to calculate, so we do it first
-        if (self.view.cursor_position < self.view.start_position) {
-            const line_range = document.rope.getLineRange(self.view.cursor_position) orelse .{ 0, 0 };
+        if (self.view.cursor.head < self.view.start_position) {
+            const line_range = document.rope.getLineRange(self.view.cursor.head) orelse .{ 0, 0 };
             self.view.start_position = line_range[0];
         } else {
             const coords = self.calculateCursorViewCoords();
-            if (coords.line + 2 > self.view.lines) {
-                const line_difference = coords.line + 2 - self.view.lines;
-                const new_start_position = document.rope.add(
-                    self.view.start_position,
-                    ed.Rope.Coordinate{ .line = line_difference, .column = 0 },
-                    ed.Rope.Position,
-                );
-                self.view.start_position = new_start_position;
+            if (coords.line + 3 > self.view.lines) {
+                const line_difference = coords.line + 3 - self.view.lines;
+                self.moveCursorDown(line_difference, false);
+            }
+        }
+    }
+}
+
+// ********************* VISUAL COMMANDS *********************
+
+pub fn commandVisualDelete(self: *Self, movement: ?Movement) void {
+    _ = movement;
+
+    const document = self.documents.getPtr(self.current_document) orelse return;
+    _ = document.rope.deleteRange(self.view.cursor.tail, self.view.cursor.head + 1);
+    self.view.cursor.head = self.view.cursor.tail;
+    self.mode = .normal;
+}
+
+pub fn commandVisualSearch(self: *Self, movement: ?Movement) void {
+    _ = movement;
+
+    const document = self.documents.getPtr(self.current_document) orelse return;
+
+    if (self.matcher) |*m| {
+        var match_opt = m.next();
+        if (match_opt) |match| {
+            self.adjustViewToCursorPosition(match.getOrdered()[0]);
+            self.view.cursor = match;
+        } else {
+            m.wrapNext(&document.rope);
+
+            match_opt = m.next();
+            if (match_opt) |match| {
+                self.adjustViewToCursorPosition(match.getOrdered()[0]);
+                self.view.cursor = match;
+            }
+        }
+    } else {
+        const range = self.view.cursor.getOrdered();
+        const pattern_text = document.rope.toOwnedSlice(range[0], range[1] + 1, self.allocator);
+
+        // @Robustness: memory leak
+        const pattern = ed.Pattern.parseTokenBased(pattern_text, self.allocator);
+        self.matcher = document.rope.matchStartingFrom(pattern, self.view.cursor.getOrdered()[1]);
+
+        const match_opt = self.matcher.?.next();
+        if (match_opt) |match| {
+            self.adjustViewToCursorPosition(match.getOrdered()[0]);
+            self.view.cursor = match;
+        }
+    }
+}
+
+pub fn commandVisualSearchNext(self: *Self, movement: ?Movement) void {
+    _ = movement;
+
+    const document = self.documents.getPtr(self.current_document) orelse return;
+
+    if (self.matcher) |*m| {
+        var match_opt = m.next();
+        if (match_opt) |match| {
+            self.adjustViewToCursorPosition(match.getOrdered()[0]);
+            self.view.cursor = match;
+        } else {
+            m.wrapNext(&document.rope);
+
+            match_opt = m.next();
+            if (match_opt) |match| {
+                self.adjustViewToCursorPosition(match.getOrdered()[0]);
+                self.view.cursor = match;
+            }
+        }
+    }
+}
+
+pub fn commandVisualSearchPrev(self: *Self, movement: ?Movement) void {
+    _ = movement;
+
+    const document = self.documents.getPtr(self.current_document) orelse return;
+
+    if (self.matcher) |*m| {
+        var match_opt = m.prev();
+        if (match_opt) |match| {
+            self.adjustViewToCursorPosition(match.getOrdered()[0]);
+            self.view.cursor = match;
+        } else {
+            m.wrapPrev(&document.rope);
+
+            match_opt = m.prev();
+            if (match_opt) |match| {
+                self.adjustViewToCursorPosition(match.getOrdered()[0]);
+                self.view.cursor = match;
             }
         }
     }
@@ -217,8 +384,7 @@ pub const Movement = enum {
 };
 
 pub const KeyMovement = struct {
-    range_start: usize = 0,
-    range_end: usize = 0,
+    selection: ed.View.Selection = .{},
     cursor_position: usize = 0,
     max_column: usize = 0,
     linewise: bool = false,
@@ -243,32 +409,31 @@ pub fn calculateKeyMovement(self: *Self, movement: Movement, comptime purpose: e
     const document = self.documents.getPtr(self.current_document) orelse return null;
 
     var result = KeyMovement{
-        .range_start = self.view.cursor_position,
-        .range_end = self.view.cursor_position,
-        .cursor_position = self.view.cursor_position,
+        .selection = self.view.cursor,
+        .cursor_position = self.view.cursor.head,
         .max_column = self.view.max_column,
         .linewise = movementIsDefaultLinewise(movement),
     };
     switch (movement) {
         .right => {
             var do_max = true;
-            if (document.rope.indexNode(self.view.cursor_position)) |node_and_offset| {
+            if (document.rope.indexNode(self.view.cursor.head)) |node_and_offset| {
                 const char = node_and_offset[0].string.items[node_and_offset[1]];
                 if (char == '\n') {
                     result.max_column = 0;
                     do_max = false;
                 }
             }
-            result.range_start = self.view.cursor_position;
-            result.range_end = self.view.cursor_position + 1;
-            result.cursor_position = self.view.cursor_position + 1;
+            result.selection.tail = self.view.cursor.tail;
+            result.selection.head = self.view.cursor.head + 1;
+            result.cursor_position = self.view.cursor.head + 1;
             if (do_max) result.max_column = self.view.max_column + 1;
         },
         .left => {
-            if (self.view.cursor_position > 0) {
-                result.range_start = self.view.cursor_position - 1;
-                result.range_end = self.view.cursor_position;
-                result.cursor_position = self.view.cursor_position - 1;
+            if (self.view.cursor.head > 0) {
+                result.selection.tail = self.view.cursor.tail;
+                result.selection.head = self.view.cursor.head - 1;
+                result.cursor_position = self.view.cursor.head - 1;
                 result.max_column = self.view.max_column -| 1;
 
                 if (document.rope.indexNode(result.cursor_position)) |node_and_offset| {
@@ -281,18 +446,18 @@ pub fn calculateKeyMovement(self: *Self, movement: Movement, comptime purpose: e
             }
         },
         .up => {
-            if (self.view.cursor_position > 0) {
-                if (document.rope.getPreviousLineRange(self.view.cursor_position)) |last_line_range| {
+            if (self.view.cursor.head > 0) {
+                if (document.rope.getPreviousLineRange(self.view.cursor.head)) |last_line_range| {
                     switch (purpose) {
                         .move => {
                             result.cursor_position = @min(last_line_range[0] + self.view.max_column, last_line_range[1] -| 1);
-                            result.range_start = result.cursor_position;
-                            result.range_end = self.view.cursor_position;
+                            result.selection.tail = self.view.cursor.tail;
+                            result.selection.head = result.cursor_position;
                         },
                         .delete => {
-                            const current_line_range = document.rope.getLineRange(self.view.cursor_position).?;
-                            result.range_start = last_line_range[0];
-                            result.range_end = current_line_range[1];
+                            const current_line_range = document.rope.getLineRange(self.view.cursor.head).?;
+                            result.selection.tail = last_line_range[0];
+                            result.selection.head = current_line_range[1];
 
                             if (last_line_range[0] == 0) {
                                 result.cursor_position = 0;
@@ -308,17 +473,17 @@ pub fn calculateKeyMovement(self: *Self, movement: Movement, comptime purpose: e
             }
         },
         .down => {
-            if (document.rope.getNextLineRange(self.view.cursor_position)) |next_line_range| {
+            if (document.rope.getNextLineRange(self.view.cursor.head)) |next_line_range| {
                 switch (purpose) {
                     .move => {
                         result.cursor_position = @min(next_line_range[0] + self.view.max_column, next_line_range[1] -| 1);
-                        result.range_start = self.view.cursor_position;
-                        result.range_end = result.cursor_position;
+                        result.selection.tail = self.view.cursor.tail;
+                        result.selection.head = result.cursor_position;
                     },
                     .delete => {
-                        const current_line_range = document.rope.getLineRange(self.view.cursor_position).?;
-                        result.range_start = current_line_range[0];
-                        result.range_end = next_line_range[1];
+                        const current_line_range = document.rope.getLineRange(self.view.cursor.head).?;
+                        result.selection.tail = current_line_range[0];
+                        result.selection.head = next_line_range[1];
 
                         const after_line_range = document.rope.getLineRange(next_line_range[1]).?;
                         result.cursor_position = current_line_range[0] + @min(self.view.max_column, after_line_range[1] - after_line_range[0] - 1);
@@ -327,48 +492,48 @@ pub fn calculateKeyMovement(self: *Self, movement: Movement, comptime purpose: e
             }
         },
         .word_forward => {
-            const offset = document.rope.getNextWord(self.view.cursor_position);
-            result.cursor_position = self.view.cursor_position + offset;
-            result.range_start = self.view.cursor_position;
-            result.range_end = result.cursor_position;
+            const offset = document.rope.getNextWord(self.view.cursor.head);
+            result.cursor_position = self.view.cursor.head + offset;
+            result.selection.tail = self.view.cursor.tail;
+            result.selection.head = result.cursor_position;
 
             const line_range = document.rope.getLineRange(result.cursor_position).?; // right now this can't return null
             result.max_column = result.cursor_position - line_range[0];
         },
         .word_backward => {
-            const offset = document.rope.getPreviousWord(self.view.cursor_position);
-            result.cursor_position = self.view.cursor_position - offset;
-            result.range_start = result.cursor_position;
-            result.range_end = self.view.cursor_position;
+            const offset = document.rope.getPreviousWord(self.view.cursor.head);
+            result.cursor_position = self.view.cursor.head - offset;
+            result.selection.tail = self.view.cursor.tail;
+            result.selection.head = result.cursor_position;
 
             const line_range = document.rope.getLineRange(result.cursor_position).?; // right now this can't return null
             result.max_column = result.cursor_position - line_range[0];
         },
         .word_end_forward => {
-            const offset = document.rope.getNextWordEnd(self.view.cursor_position);
+            const offset = document.rope.getNextWordEnd(self.view.cursor.head);
             switch (purpose) {
                 .move => {
-                    result.cursor_position = self.view.cursor_position + offset;
+                    result.cursor_position = self.view.cursor.head + offset;
                 },
                 .delete => {
-                    result.cursor_position = self.view.cursor_position + offset + 1;
+                    result.cursor_position = self.view.cursor.head + offset + 1;
                 },
             }
-            result.range_start = self.view.cursor_position;
-            result.range_end = result.cursor_position; // inclusive
+            result.selection.tail = self.view.cursor.tail;
+            result.selection.head = result.cursor_position; // inclusive
 
             const line_range = document.rope.getLineRange(result.cursor_position).?; // right now this can't return null
             result.max_column = result.cursor_position - line_range[0];
         },
         .start_of_line => {
-            const line_range = document.rope.getLineRange(result.cursor_position).?; // right now this can't return null
-            result.range_start = line_range[0];
-            result.range_end = self.view.cursor_position;
+            const line_range = document.rope.getLineRange(self.view.cursor.head).?; // right now this can't return null
+            result.selection.tail = self.view.cursor.tail;
+            result.selection.head = line_range[0];
             result.cursor_position = line_range[0];
             result.max_column = 0;
         },
         .start_of_line_non_blank => {
-            const line_range = document.rope.getLineRange(result.cursor_position).?; // right now this can't return null
+            const line_range = document.rope.getLineRange(self.view.cursor.head).?; // right now this can't return null
 
             var current_offset = line_range[0];
             var current_node, var current_node_offset = document.rope.indexNode(line_range[0]).?;
@@ -379,24 +544,19 @@ pub fn calculateKeyMovement(self: *Self, movement: Movement, comptime purpose: e
                     else => break,
                 }
 
-                current_node, current_node_offset = document.rope.nextNodeChar(current_node, current_node_offset) orelse break;
+                current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse break;
             }
 
             result.cursor_position = current_offset;
-            if (self.view.cursor_position > current_offset) {
-                result.range_start = current_offset;
-                result.range_end = self.view.cursor_position;
-            } else {
-                result.range_start = self.view.cursor_position;
-                result.range_end = current_offset;
-            }
+            result.selection.tail = self.view.cursor.tail;
+            result.selection.head = current_offset;
 
             result.max_column = result.cursor_position - line_range[0];
         },
         .end_of_line => {
-            const line_range = document.rope.getLineRange(result.cursor_position).?; // right now this can't return null
-            result.range_start = self.view.cursor_position;
-            result.range_end = line_range[1];
+            const line_range = document.rope.getLineRange(self.view.cursor.head).?; // right now this can't return null
+            result.selection.tail = self.view.cursor.tail;
+            result.selection.head = line_range[1];
             result.max_column = 0;
         },
     }
@@ -405,7 +565,7 @@ pub fn calculateKeyMovement(self: *Self, movement: Movement, comptime purpose: e
 
 pub fn calculateCursorViewCoords(self: *Self) ed.Rope.Coordinate {
     const current_document = self.documents.getPtr(self.current_document).?;
-    const result = current_document.rope.lineColumnFromRelativePosition(self.view.start_position, self.view.cursor_position).?;
+    const result = current_document.rope.lineColumnFromRelativePosition(self.view.start_position, self.view.cursor.head).?;
     // const result = current_document.rope.add(self.view.cursor_position, 0, ed.Rope.Coordinate);
     return result;
 }
@@ -417,7 +577,7 @@ pub fn render(self: *Self, area: ed.Rect, renderer: *ed.Renderer) void {
         var text_iterator = current_document.rope.iterUtf16StartingFrom(&output_buffer, self.view.start_position);
 
         const bg_color_ = ed.Color.init(40, 40, 60);
-        var current_char_offset: usize = 0;
+        var current_char_offset: usize = self.view.start_position;
 
         var x: u16 = @truncate(area.left);
         var y: u16 = @truncate(area.top);
@@ -443,13 +603,15 @@ pub fn render(self: *Self, area: ed.Rect, renderer: *ed.Renderer) void {
             var bg_color = bg_color_;
 
             var cursor_kind: ed.CursorKind = .hidden;
-            if (self.view.cursor_position >= self.view.start_position and current_char_offset == (self.view.cursor_position - self.view.start_position)) {
+            if (self.view.cursor.head >= self.view.start_position and current_char_offset == self.view.cursor.head) {
                 cursor_kind = switch (self.mode) {
                     .insert => .bar,
                     .normal => .block,
+                    .visual => .block,
                 };
                 renderer.set_cursor_style(.init(0xff, 0xdd, 0x33), bg_color);
-                // std.mem.swap(ed.Color, &fg_color, &bg_color);
+            } else if (self.view.cursor.tail >= self.view.start_position and self.view.cursor.containsPosition(current_char_offset)) {
+                bg_color = .red;
             }
 
             if (codepoint.len == 1) {
@@ -486,14 +648,19 @@ pub fn render(self: *Self, area: ed.Rect, renderer: *ed.Renderer) void {
         }
 
         // const cursor_coord = current_document.rope.lineColumnFromRelativePosition(self.view.start_position, self.view.cursor_position);
-        // renderer.place_glyph(
-        //     @truncate(cursor_coord[0] + area.left),
-        //     @truncate(cursor_coord[1] + area.top),
-        //     &.{' '},
-        //     .white,
-        //     .red,
-        //     .red,
-        //     .none,
-        // );
+        if (true) {
+            const mode_display = switch (self.mode) {
+                .insert => .{ "INSERT", ed.Color.red },
+                .normal => .{ "NORMAL", ed.Color.green },
+                .visual => .{ "VISUAL", ed.Color.init(255, 0, 255) },
+            };
+
+            x = @truncate(area.left);
+            y = @truncate(area.bottom - 2);
+            for (mode_display[0]) |c| {
+                renderer.place_glyph(x, y, &.{@as(u16, c)}, .init(0, 0, 0), mode_display[1], .red, .none, .hidden);
+                x += 1;
+            }
+        }
     }
 }
