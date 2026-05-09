@@ -834,8 +834,9 @@ pub const Renderer = struct {
                 @as(i64, font_metrics.designUnitsPerEm),
             );
 
+            _ = underline_size;
             mapped.underline_position_and_thickness =
-                @as(u32, @intCast((-underline_position + @as(i64, self.cell_height) - descent))) | @as(u32, @intCast(((underline_size) << 16)));
+                @as(u32, @intCast((-underline_position + @as(i64, self.cell_height) - descent))) | @as(u32, @intCast(((2) << 16)));
             self.parameter_buffer.unmap(self.d3d_context);
         }
     }

@@ -25,6 +25,7 @@ mode: enum {
     insert,
     normal,
     visual,
+    visual_line,
 } = .normal,
 
 registers: Registers = .{},
@@ -92,7 +93,7 @@ pub fn handleEvent(self: *Self, event: ed.Event) void {
             switch (self.mode) {
                 .insert => self.handleInsertModeKeydown(event),
                 .normal => self.handleNormalModeKeydown(event),
-                .visual => self.handleVisualModeKeydown(event),
+                .visual, .visual_line => self.handleVisualModeKeydown(event),
             }
         },
         .timer => |timer_id| {
@@ -171,7 +172,14 @@ pub fn handleVisualModeKeydown(self: *Self, event: ed.Event) void {
         },
         .escape => {
             self.key_dispatch_state = .{};
+
+            if (self.mode == .visual_line) blk: {
+                const document = self.documents.getPtr(self.current_document) orelse break :blk;
+                const line_range = document.rope.getLineRange(self.view.cursor.head) orelse break :blk;
+                self.view.cursor.head = @min(line_range[0] + self.view.max_column, line_range[1] -| 1);
+            }
             self.view.cursor.tail = self.view.cursor.head;
+
             self.mode = .normal;
         },
     }
@@ -185,6 +193,36 @@ pub fn setCursor(self: *Self, position: usize) void {
         },
         .visual => {
             self.view.cursor.head = position;
+        },
+        .visual_line => {
+            const document = self.documents.getPtr(self.current_document) orelse return;
+            const line_range = document.rope.getLineRange(position) orelse .{ 0, 0 };
+
+            if (position < self.view.cursor.tail) {
+                self.view.cursor.head = line_range[0];
+
+                if (self.view.cursor.tail >= line_range[1]) {
+                    const tail_line_range = document.rope.getLineRange(self.view.cursor.tail) orelse return;
+                    self.view.cursor.tail = tail_line_range[1] -| 1;
+                } else {
+                    self.view.cursor.tail = line_range[1] -| 1;
+                }
+            } else {
+                self.view.cursor.head = line_range[1] -| 1;
+
+                if (self.view.cursor.tail < line_range[0]) {
+                    const tail_line_range = document.rope.getLineRange(self.view.cursor.tail) orelse return;
+                    self.view.cursor.tail = tail_line_range[0];
+                } else {
+                    self.view.cursor.tail = line_range[0];
+                }
+            }
+
+            // if (position < self.view.cursor.tail) {
+            //     self.view.cursor.head = line_range[0];
+            // } else {
+            //     self.view.cursor.head = line_range[1] -| 1;
+            // }
         },
     }
 }
@@ -448,6 +486,34 @@ pub fn commandEnterVisualMode(self: *Self, dispatch: *DispatchState) void {
     self.mode = .visual;
 }
 
+pub fn commandEnterVisualLineMode(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
+    self.mode = .visual_line;
+
+    const document = self.documents.getPtr(self.current_document) orelse return;
+    const line_range = document.rope.getLineRange(self.view.cursor.head) orelse return;
+
+    if (self.view.cursor.head < self.view.cursor.tail) {
+        self.view.cursor.head = line_range[0];
+
+        if (self.view.cursor.tail >= line_range[1]) {
+            const tail_line_range = document.rope.getLineRange(self.view.cursor.tail) orelse return;
+            self.view.cursor.tail = tail_line_range[1] -| 1;
+        } else {
+            self.view.cursor.tail = line_range[1] -| 1;
+        }
+    } else {
+        self.view.cursor.head = line_range[1] -| 1;
+
+        if (self.view.cursor.tail < line_range[0]) {
+            const tail_line_range = document.rope.getLineRange(self.view.cursor.tail) orelse return;
+            self.view.cursor.tail = tail_line_range[0];
+        } else {
+            self.view.cursor.tail = line_range[0];
+        }
+    }
+}
+
 pub fn commandDeleteMovement(self: *Self, dispatch: *DispatchState) void {
     const movement_result = self.calculateKeyMovement(dispatch.movement.?, dispatch.chars(), .delete) orelse return;
     const document = self.documents.getPtr(self.current_document) orelse return;
@@ -518,11 +584,15 @@ pub fn commandVisualYank(self: *Self, dispatch: *DispatchState) void {
 
     const ordered = self.view.cursor.getOrdered();
     const slice = document.rope.toOwnedSlice(ordered[0], ordered[1] + 1, self.allocator);
-    self.registers.setRegister('"', slice, false);
+    self.registers.setRegister('"', slice, (self.mode == .visual_line));
 
     self.last_yanked_range = self.view.cursor;
     self.application_vtable.start_timer(self.application, .yank_highlight, config.yank_highlight_time);
 
+    if (self.mode == .visual_line) {
+        const line_range = document.rope.getLineRange(self.view.cursor.head) orelse return;
+        self.view.cursor.head = @min(line_range[0] + self.view.max_column, line_range[1] -| 1);
+    }
     self.view.cursor.tail = self.view.cursor.head;
     self.mode = .normal;
 }
@@ -573,7 +643,9 @@ pub fn commandMove(self: *Self, dispatch: *DispatchState) void {
     const movement_result = self.calculateKeyMovement(dispatch.movement.?, dispatch.chars(), .move);
     if (movement_result) |move| {
         self.setCursor(move.selection.head);
-        self.view.max_column = move.max_column;
+        if (self.mode != .visual_line) {
+            self.view.max_column = move.max_column;
+        }
 
         const document = self.documents.getPtr(self.current_document) orelse return;
 
@@ -600,10 +672,22 @@ pub fn commandVisualDelete(self: *Self, dispatch: *DispatchState) void {
     const ordered = self.view.cursor.getOrdered();
     _ = document.rope.deleteRange(ordered[0], ordered[1] + 1);
 
-    if (self.view.cursor.tail < self.view.cursor.head) {
-        self.view.cursor.head = self.view.cursor.tail;
+    if (self.mode == .visual_line) {
+        if (self.view.cursor.tail < self.view.cursor.head) {
+            const line_range = document.rope.getLineRange(self.view.cursor.tail) orelse return;
+            self.view.cursor.tail = @min(line_range[0] + self.view.max_column, line_range[1] -| 1);
+            self.view.cursor.head = self.view.cursor.tail;
+        } else {
+            const line_range = document.rope.getLineRange(self.view.cursor.head) orelse return;
+            self.view.cursor.head = @min(line_range[0] + self.view.max_column, line_range[1] -| 1);
+            self.view.cursor.tail = self.view.cursor.head;
+        }
     } else {
-        self.view.cursor.tail = self.view.cursor.head;
+        if (self.view.cursor.tail < self.view.cursor.head) {
+            self.view.cursor.head = self.view.cursor.tail;
+        } else {
+            self.view.cursor.tail = self.view.cursor.head;
+        }
     }
     self.mode = .normal;
 }
@@ -614,7 +698,25 @@ pub fn commandVisualChange(self: *Self, dispatch: *DispatchState) void {
     const document = self.documents.getPtr(self.current_document) orelse return;
     const ordered = self.view.cursor.getOrdered();
     _ = document.rope.deleteRange(ordered[0], ordered[1] + 1);
-    self.view.cursor.head = self.view.cursor.tail;
+
+    if (self.mode == .visual_line) {
+        if (self.view.cursor.tail < self.view.cursor.head) {
+            const line_range = document.rope.getLineRange(self.view.cursor.tail) orelse return;
+            self.view.cursor.tail = @min(line_range[0] + self.view.max_column, line_range[1] -| 1);
+            self.view.cursor.head = self.view.cursor.tail;
+        } else {
+            const line_range = document.rope.getLineRange(self.view.cursor.head) orelse return;
+            self.view.cursor.head = @min(line_range[0] + self.view.max_column, line_range[1] -| 1);
+            self.view.cursor.tail = self.view.cursor.head;
+        }
+    } else {
+        if (self.view.cursor.tail < self.view.cursor.head) {
+            self.view.cursor.head = self.view.cursor.tail;
+        } else {
+            self.view.cursor.tail = self.view.cursor.head;
+        }
+    }
+
     self.mode = .insert;
 }
 
@@ -1106,6 +1208,7 @@ pub fn render(self: *Self, area: ed.Rect, renderer: *ed.Renderer) void {
                     .insert => .bar,
                     .normal => .block,
                     .visual => .block,
+                    .visual_line => .block,
                 };
                 renderer.set_cursor_style(.init(0xff, 0xdd, 0x33), bg_color);
             } else if (self.view.cursor.containsPosition(current_char_offset)) {
@@ -1153,15 +1256,20 @@ pub fn render(self: *Self, area: ed.Rect, renderer: *ed.Renderer) void {
         // const cursor_coord = current_document.rope.lineColumnFromRelativePosition(self.view.start_position, self.view.cursor_position);
         if (true) {
             const mode_display = switch (self.mode) {
-                .insert => .{ "INSERT", ed.Color.red },
-                .normal => .{ "NORMAL", ed.Color.green },
-                .visual => .{ "VISUAL", ed.Color.init(255, 0, 255) },
+                .insert => .{ "INSERT", ed.Color.red, ed.UnderlineStyle.none },
+                .normal => .{ "NORMAL", ed.Color.green, ed.UnderlineStyle.none },
+                .visual => .{ "VISUAL", ed.Color.init(255, 0, 255), ed.UnderlineStyle.none },
+                .visual_line => .{ " LINE ", ed.Color.init(0, 200, 255), ed.UnderlineStyle.line },
             };
 
             x = @truncate(area.left);
             y = @truncate(area.bottom - 2);
             for (mode_display[0]) |c| {
-                renderer.place_glyph(x, y, &.{@as(u16, c)}, .init(0, 0, 0), mode_display[1], .red, .none, .hidden);
+                if (c == ' ') {
+                    renderer.place_glyph(x, y, &.{@as(u16, c)}, .init(0, 0, 0), mode_display[1], .init(0, 0, 0), .none, .hidden);
+                } else {
+                    renderer.place_glyph(x, y, &.{@as(u16, c)}, .init(0, 0, 0), mode_display[1], .init(0, 0, 0), mode_display[2], .hidden);
+                }
                 x += 1;
             }
         }

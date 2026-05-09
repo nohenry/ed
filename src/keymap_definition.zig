@@ -12,6 +12,7 @@ pub const normal_keymap_definition = .{
     .{ 'O', "commandEnterInsertModeAboveLine" },
     .{ 'o', "commandEnterInsertModeBelowLine" },
     .{ 'v', "commandEnterVisualMode" },
+    .{ 'V', "commandEnterVisualLineMode" },
 
     .{ 'd', movement, "commandDeleteMovement" },
     .{ 'd', 'd', "commandDeleteLine" },

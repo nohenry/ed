@@ -1,3 +1,3 @@
 digraph {
-node0 [label="3\n// "];
+node0 [label="178\npub fn build(b: *std.Build) void {\n    const target = b.standardTargetOptions(.{});\n    const optimize = b.standardOptimizeOption(.{});\n\n    const mod = b.addModule(\\editor\\, .{\n"];
 }
