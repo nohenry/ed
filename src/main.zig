@@ -21,6 +21,9 @@ fn window_proc(hwnd: win32.HWND, message: win32.UINT, wparam: win32.WPARAM, lpar
             _ = win32.DestroyWindow(hwnd);
             return 0;
         },
+        win32.WM_TIMER => {
+            application.?.handleEvent(.{ .timer = @enumFromInt(wparam) });
+        },
         win32.WM_SIZE => {
             const new_height: u32 = @as(u32, @intCast(lparam >> 16));
             const new_width: u32 = @as(u32, @intCast(lparam & 0xFFFF));
@@ -85,6 +88,11 @@ fn window_proc(hwnd: win32.HWND, message: win32.UINT, wparam: win32.WPARAM, lpar
     return win32.DefWindowProcA(hwnd, message, wparam, lparam);
 }
 
+pub const win32_applicaiton = ed.Editor.ApplicationVtable{
+    .start_timer = Application.start_timer,
+    .kill_timer = Application.kill_timer,
+};
+
 pub const Application = struct {
     hwnd: win32.HWND = null,
     keep_running: bool = true,
@@ -92,6 +100,16 @@ pub const Application = struct {
     allocator: std.mem.Allocator = undefined,
 
     editor: ?*ed.Editor = null,
+
+    pub fn start_timer(self_: *anyopaque, id: ed.TimerId, milliseconds: usize) void {
+        const self: *Application = @ptrCast(@alignCast(self_));
+        _ = win32.SetTimer(self.hwnd, @intFromEnum(id), @intCast(milliseconds), null);
+    }
+
+    pub fn kill_timer(self_: *anyopaque, id: ed.TimerId) void {
+        const self: *Application = @ptrCast(@alignCast(self_));
+        _ = win32.KillTimer(self.hwnd, @intFromEnum(id));
+    }
 
     pub fn initPinned(self: *Application, io: std.Io, allocator: std.mem.Allocator) void {
         self.allocator = allocator;
@@ -134,7 +152,7 @@ pub const Application = struct {
 
     pub fn createEditor(self: *Application, io: std.Io) void {
         self.editor = self.allocator.create(ed.Editor) catch @panic("OOM");
-        self.editor.?.* = .init(io, self.allocator);
+        self.editor.?.* = .init(self, &win32_applicaiton, io, self.allocator);
         self.editor.?.openDocument("build.zig");
     }
 

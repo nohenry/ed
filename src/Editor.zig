@@ -1,6 +1,7 @@
 const std = @import("std");
 const ed = @import("ed.zig");
 const keymap = @import("keymap");
+const config = @import("config.zig");
 
 comptime {
     _ = keymap;
@@ -10,6 +11,8 @@ pub const Self = @This();
 
 const DispatchState = keymap.DispatchState(Movement);
 
+application: *anyopaque,
+application_vtable: *const ApplicationVtable,
 io: std.Io,
 allocator: std.mem.Allocator,
 scratch: std.heap.ArenaAllocator,
@@ -24,6 +27,9 @@ mode: enum {
     visual,
 } = .normal,
 
+registers: Registers = .{},
+last_yanked_range: ?ed.View.Selection = null,
+
 saved_insert_node: ?*ed.Rope.Node = null,
 
 key_dispatch_state: DispatchState = .{},
@@ -33,10 +39,30 @@ matcher: ?ed.Rope.Matcher = null,
 last_find: ?u32 = null,
 last_find_kind: ToTill = .to,
 
+pub const ApplicationVtable = struct {
+    start_timer: *const fn (data: *anyopaque, id: ed.TimerId, milliseconds: usize) void,
+    kill_timer: *const fn (data: *anyopaque, id: ed.TimerId) void,
+};
+
 pub const ToTill = enum { to, till };
 
-pub fn init(io: std.Io, allocator: std.mem.Allocator) Self {
+pub const Registers = struct {
+    pub const Register = struct { []const u8, bool };
+    registers: [127 - 32]Register = [1]Register{.{ "", false }} ** (127 - 32),
+
+    pub fn setRegister(self: *Registers, register: u8, string: []const u8, linewise: bool) void {
+        self.registers[register - 32] = .{ string, linewise };
+    }
+
+    pub fn getRegister(self: *Registers, register: u8) Register {
+        return self.registers[register - 32];
+    }
+};
+
+pub fn init(application: *anyopaque, application_vtable: *const ApplicationVtable, io: std.Io, allocator: std.mem.Allocator) Self {
     return .{
+        .application = application,
+        .application_vtable = application_vtable,
         .io = io,
         .allocator = allocator,
         .scratch = .init(std.heap.page_allocator),
@@ -67,6 +93,15 @@ pub fn handleEvent(self: *Self, event: ed.Event) void {
                 .insert => self.handleInsertModeKeydown(event),
                 .normal => self.handleNormalModeKeydown(event),
                 .visual => self.handleVisualModeKeydown(event),
+            }
+        },
+        .timer => |timer_id| {
+            switch (timer_id) {
+                .yank_highlight => {
+                    self.application_vtable.kill_timer(self.application, timer_id);
+                    self.last_yanked_range = null;
+                },
+                _ => {},
             }
         },
     }
@@ -446,6 +481,78 @@ pub fn commandChangeMovement(self: *Self, dispatch: *DispatchState) void {
         self.setCursor(movement_result.cursor_position);
     }
     self.mode = .insert;
+}
+
+pub fn commandYankMovement(self: *Self, dispatch: *DispatchState) void {
+    const movement_result = self.calculateKeyMovement(dispatch.movement.?, dispatch.chars(), .delete) orelse return;
+    const document = self.documents.getPtr(self.current_document) orelse return;
+
+    const ordered = movement_result.selection.getOrdered();
+    const slice = document.rope.toOwnedSlice(ordered[0], ordered[1], self.allocator);
+    self.registers.setRegister('"', slice, movement_result.linewise);
+
+    self.last_yanked_range = movement_result.selection;
+    self.application_vtable.start_timer(self.application, .yank_highlight, config.yank_highlight_time);
+}
+
+pub fn commandYankLine(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
+    const document = self.documents.getPtr(self.current_document) orelse return;
+    const line_range = document.rope.getLineRange(self.view.cursor.head) orelse {
+        self.registers.setRegister('"', "", true);
+        self.last_yanked_range = .{ .tail = 0, .head = 0 };
+        return;
+    };
+
+    const slice = document.rope.toOwnedSlice(line_range[0], line_range[1], self.allocator);
+    self.registers.setRegister('"', slice, true);
+
+    self.last_yanked_range = .{ .tail = line_range[0], .head = line_range[1] };
+
+    self.application_vtable.start_timer(self.application, .yank_highlight, config.yank_highlight_time);
+}
+
+pub fn commandVisualYank(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
+    const document = self.documents.getPtr(self.current_document) orelse return;
+
+    const ordered = self.view.cursor.getOrdered();
+    const slice = document.rope.toOwnedSlice(ordered[0], ordered[1] + 1, self.allocator);
+    self.registers.setRegister('"', slice, false);
+
+    self.last_yanked_range = self.view.cursor;
+    self.application_vtable.start_timer(self.application, .yank_highlight, config.yank_highlight_time);
+
+    self.view.cursor.tail = self.view.cursor.head;
+    self.mode = .normal;
+}
+
+pub fn commandPasteAfter(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
+    const document = self.documents.getPtr(self.current_document) orelse return;
+
+    const text, const linewise = self.registers.getRegister('"');
+    if (linewise) {
+        const line_range = document.rope.getLineRange(self.view.cursor.head) orelse .{ 0, 0 };
+        _ = document.rope.insertString(line_range[1], text);
+        self.setCursor(line_range[1]);
+    } else {
+        _ = document.rope.insertString(@min(self.view.cursor.head + 1, document.rope.len), text);
+    }
+}
+
+pub fn commandPasteBefore(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
+    const document = self.documents.getPtr(self.current_document) orelse return;
+
+    const text, const linewise = self.registers.getRegister('"');
+    if (linewise) {
+        const line_range = document.rope.getLineRange(self.view.cursor.head) orelse .{ 0, 0 };
+        _ = document.rope.insertString(line_range[0], text);
+        self.setCursor(line_range[0]);
+    } else {
+        _ = document.rope.insertString(self.view.cursor.head, text);
+    }
 }
 
 pub fn commandMoveUpHalfView(self: *Self, dispatch: *DispatchState) void {
@@ -1003,6 +1110,11 @@ pub fn render(self: *Self, area: ed.Rect, renderer: *ed.Renderer) void {
                 renderer.set_cursor_style(.init(0xff, 0xdd, 0x33), bg_color);
             } else if (self.view.cursor.containsPosition(current_char_offset)) {
                 bg_color = .red;
+            } else if (self.last_yanked_range) |yank_range| {
+                if (yank_range.containsPosition(current_char_offset)) {
+                    fg_color = bg_color;
+                    bg_color = .green;
+                }
             }
 
             if (codepoint.len == 1) {

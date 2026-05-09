@@ -19,12 +19,19 @@ pub const KeyModifiers = packed struct(u3) {
     shift: u1 = 0,
     alt: u1 = 0,
 };
+
+pub const TimerId = enum(usize) {
+    yank_highlight = 1,
+    _,
+};
+
 pub const Event = union(enum) {
     key_down: struct {
         key: Key,
         char: u32 = 0,
         modifers: KeyModifiers,
     },
+    timer: TimerId,
 };
 
 pub const Config = struct {

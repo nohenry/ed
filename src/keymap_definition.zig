@@ -18,6 +18,12 @@ pub const normal_keymap_definition = .{
 
     .{ 'c', movement, "commandChangeMovement" },
 
+    .{ 'y', movement, "commandYankMovement" },
+    .{ 'y', 'y', "commandYankLine" },
+
+    .{ 'p', "commandPasteAfter" },
+    .{ 'P', "commandPasteBefore" },
+
     .{ 'x', "commandDeleteUnder" },
 
     .{ .{ ctrl, 'u' }, "commandMoveUpHalfView" },
@@ -30,6 +36,8 @@ pub const visual_keymap_definition = .{
     .{ 'd', "commandVisualDelete" },
     .{ 'c', "commandVisualChange" },
     .{ 'x', "commandDeleteUnder" },
+
+    .{ 'y', "commandVisualYank" },
 
     .{ '*', "commandVisualSearch" },
     .{ '#', "commandVisualSearchReverse" },
