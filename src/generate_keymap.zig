@@ -12,7 +12,7 @@ pub fn main(init: std.process.Init) !void {
     var writer = file.writer(init.io, &.{});
 
     _ = try writer.interface.write("pub const DispatchResult = enum { not_mapped, waiting, dispatched_command };\n");
-    _ = try writer.interface.write("pub const DispatchState = struct { state: usize = 0, characters: [4]u32 = [4]u32{0,0,0,0}, character_count: usize = 0, };\n");
+    _ = try writer.interface.write("pub fn DispatchState(comptime Movement: type) type { return struct { state: usize = 0, characters: [4]u32 = [4]u32{0,0,0,0}, character_count: usize = 0, movement: ?Movement = null, pub fn chars(self: *const @This()) []const u32 { return self.characters[0..self.character_count]; } }; }\n");
 
     try generate(&writer.interface, "dispatchNormalCommand", @import("keymap_definition.zig").normal_keymap_definition);
     try generate(&writer.interface, "dispatchVisualCommand", @import("keymap_definition.zig").visual_keymap_definition);
@@ -96,96 +96,219 @@ pub fn movementKeysNeedsChar(comptime movement_: Movement) bool {
         .find_prev,
         .find_till_next,
         .find_till_prev,
-        .find_again_next,
-        .find_again_prev,
         => true,
         else => false,
     };
 }
 
-const KeyNode = struct {
-    leaf: ?[]const u8 = null,
-    leaf_movement: ?Movement = null,
-    leaf_character: bool = false,
-    keys: std.AutoHashMapUnmanaged(KeyCombo, *KeyNode) = .empty,
+// Node(root) -> Node('d') -> Node(movement 'f') -> Node(character)
+//  children      children     movement              character
+
+// Node(root) -> Node('d') -> Node(movement 'f') -> Node('f')
+//  children      children     movement              character
+
+const KeyComboMap = std.AutoHashMapUnmanaged(KeyCombo, *KeyNode1);
+
+const KeyNode1 = struct {
     state: usize = 0,
+    movement: ?Movement = null,
+    next: union(enum) {
+        invalid,
+        leaf: []const u8,
+        character: ?*KeyNode1,
+        children: KeyComboMap,
+    },
+    generated: bool = false,
+
+    pub fn format(self: *const KeyNode1, w: *std.Io.Writer) !void {
+        try self.formatImpl(w, 0);
+    }
+
+    pub fn formatImpl(self: *const KeyNode1, w: *std.Io.Writer, indent: usize) !void {
+        for (0..indent) |_| _ = try w.writeAll("   ");
+
+        switch (self.next) {
+            .invalid => try w.print("Node Invalid\n", .{}),
+            .leaf => |l| try w.print("Node Leaf '{s}' {*}\n", .{ l, self }),
+            .character => |c| {
+                try w.print("Node Character {} {*}\n", .{ self.state, self });
+                if (c) |sc| try sc.formatImpl(w, indent + 1);
+            },
+            .children => |c| {
+                var iter = c.iterator();
+                try w.print("Node Children: {} {*}\n", .{ self.state, self });
+                while (iter.next()) |entry| {
+                    for (0..indent + 1) |_| _ = try w.writeAll("   ");
+
+                    try w.print("'{c}' => \n", .{entry.key_ptr.char});
+                    try entry.value_ptr.*.formatImpl(w, indent + 2);
+                }
+            },
+        }
+    }
 };
 
 fn generate(writer: *std.Io.Writer, dispatch_function_name: []const u8, comptime keymap: anytype) !void {
-    var root = KeyNode{};
+    var root = KeyNode1{ .next = .{ .children = .empty } };
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     var allocator = arena.allocator();
 
-    inline for (keymap) |command| {
-        var current = &root;
+    var next_state: usize = 1;
 
-        var done_movement = false;
-        var done_character = false;
+    var nodes = std.ArrayList(*KeyNode1).empty;
+    inline for (keymap) |command| {
+        nodes.items.len = 0;
+        nodes.append(allocator, &root) catch @panic("OOM");
+
         inline for (command, 0..) |item, i| {
             if (i == command.len - 1) {
-                if (current.leaf_character) {
-                    current.leaf = item;
-                } else if (done_movement) {
-                    inline for (std.meta.fields(Movement)) |field| {
-                        current.keys.get(movementKeysCombo(@enumFromInt(field.value))).?.leaf = @as([]const u8, item);
+                for (nodes.items) |parent_node| {
+                    switch (parent_node.next) {
+                        .invalid => {
+                            parent_node.next = .{ .leaf = item };
+                        },
+                        .character => |ch| {
+                            ch.?.next = .{ .leaf = item };
+                        },
+                        .children => |ch| {
+                            var iter = ch.iterator();
+                            while (iter.next()) |entry| {
+                                entry.value_ptr.*.next = .{ .leaf = item };
+                            }
+                        },
+                        .leaf => {},
                     }
-                } else {
-                    current.leaf = item;
                 }
             } else {
                 if (@TypeOf(item) == comptime_int or @TypeOf(item) == u32) {
                     if (item == movement) {
+                        const these_nodes = nodes.toOwnedSlice(allocator) catch @panic("OOM");
+                        defer allocator.free(these_nodes);
+                        nodes.ensureTotalCapacity(allocator, these_nodes.len * std.meta.fields(Movement).len) catch @panic("OOM");
+                        nodes.items.len = 0;
+
+                        const char_node_state = next_state;
+                        const char_node = try allocator.create(KeyNode1);
+                        char_node.* = .{ .state = char_node_state, .next = .invalid };
+                        next_state += 1;
+
                         inline for (std.meta.fields(Movement)) |field| {
-                            const result = try current.keys.getOrPut(allocator, movementKeysCombo(@enumFromInt(field.value)));
-                            if (!result.found_existing) {
-                                const new_node = try allocator.create(KeyNode);
-                                new_node.* = .{
-                                    .leaf_movement = @enumFromInt(field.value),
-                                    .leaf_character = movementKeysNeedsChar(@enumFromInt(field.value)),
+                            const movement_ = movementKeysCombo(@enumFromInt(field.value));
+                            const needs_char = movementKeysNeedsChar(@enumFromInt(field.value));
+
+                            for (these_nodes) |parent_node| {
+                                const result = switch (parent_node.next) {
+                                    .invalid => blk: {
+                                        parent_node.next = .{ .children = .empty };
+                                        break :blk try parent_node.next.children.getOrPut(allocator, movement_);
+                                    },
+                                    .character => |*map| KeyComboMap.GetOrPutResult{ .found_existing = map.* != null, .value_ptr = &(map.*.?), .key_ptr = undefined },
+                                    .children => |*map| try map.getOrPut(allocator, movement_),
+                                    .leaf => unreachable,
                                 };
-                                result.value_ptr.* = new_node;
+
+                                if (!result.found_existing) {
+                                    const movement_state = next_state;
+                                    next_state += 1;
+
+                                    const new_node = try allocator.create(KeyNode1);
+                                    new_node.* = .{ .state = movement_state, .movement = @enumFromInt(field.value), .next = if (needs_char) .{ .character = char_node } else .invalid };
+                                    result.value_ptr.* = new_node;
+                                }
+
+                                if (needs_char) {} else {
+                                    nodes.append(allocator, result.value_ptr.*) catch @panic("OOM");
+                                }
                             }
                         }
-                        done_movement = true;
+
+                        nodes.append(allocator, char_node) catch @panic("OOM");
                     } else if (item == character) {
-                        current.leaf_character = true;
-                        // const result = try current.keys.getOrPut(allocator, .{ .char = @truncate(item) });
-                        // if (!result.found_existing) {
-                        //     const new_node = try allocator.create(KeyNode);
-                        //     new_node.* = .{
-                        //         .leaf_character = true,
-                        //     };
-                        //     result.value_ptr.* = new_node;
-                        // }
-                        // current = result.value_ptr.*;
-                        done_character = true;
-                    } else {
-                        const result = try current.keys.getOrPut(allocator, .{ .char = @truncate(item) });
-                        if (!result.found_existing) {
-                            const new_node = try allocator.create(KeyNode);
-                            new_node.* = .{};
-                            result.value_ptr.* = new_node;
+                        for (nodes.items) |*parent_node| {
+                            const result = switch (parent_node.*.next) {
+                                .invalid => blk: {
+                                    parent_node.*.next = .{ .character = @as(*KeyNode1, undefined) };
+                                    break :blk KeyComboMap.GetOrPutResult{ .found_existing = false, .value_ptr = &(parent_node.*.next.character.?), .key_ptr = undefined };
+                                },
+                                .character => |*map| KeyComboMap.GetOrPutResult{ .found_existing = map.* != null, .value_ptr = &(map.*.?), .key_ptr = undefined },
+                                .children => |*ch| {
+                                    const new_node = try allocator.create(KeyNode1);
+                                    new_node.* = .{ .state = next_state, .next = .invalid };
+                                    next_state += 1;
+
+                                    var iter = ch.iterator();
+                                    while (iter.next()) |entry| {
+                                        entry.value_ptr.*.next = .{ .character = new_node };
+                                    }
+
+                                    parent_node.* = new_node;
+
+                                    continue;
+                                },
+                                .leaf => unreachable,
+                            };
+
+                            if (!result.found_existing) {
+                                const new_node = try allocator.create(KeyNode1);
+                                new_node.* = .{ .state = next_state, .next = .invalid };
+                                next_state += 1;
+                                result.value_ptr.* = new_node;
+                            }
+
+                            parent_node.* = result.value_ptr.*;
                         }
-                        current = result.value_ptr.*;
+                    } else {
+                        for (nodes.items) |*parent_node| {
+                            const result = switch (parent_node.*.next) {
+                                .invalid => blk: {
+                                    parent_node.*.next = .{ .children = .empty };
+                                    break :blk try parent_node.*.next.children.getOrPut(allocator, .{ .char = @truncate(item) });
+                                },
+                                .character => |*map| KeyComboMap.GetOrPutResult{ .found_existing = map.* != null, .value_ptr = &(map.*.?), .key_ptr = undefined },
+                                .children => |*map| try map.getOrPut(allocator, .{ .char = @truncate(item) }),
+                                .leaf => unreachable,
+                            };
+
+                            if (!result.found_existing) {
+                                const new_node = try allocator.create(KeyNode1);
+                                new_node.* = .{ .state = next_state, .next = .invalid };
+                                next_state += 1;
+                                result.value_ptr.* = new_node;
+                            }
+
+                            parent_node.* = result.value_ptr.*;
+                        }
                     }
                 } else if (@typeInfo(@TypeOf(item)) == .@"struct") {
-                    const new_node = try allocator.create(KeyNode);
-                    new_node.* = .{};
-                    try current.keys.put(allocator, movementTupleToCombo(item), new_node);
+                    for (nodes.items) |*parent_node| {
+                        const new_node = try allocator.create(KeyNode1);
+                        new_node.* = .{ .next = .invalid };
 
-                    current = new_node;
+                        switch (parent_node.*.next) {
+                            .invalid => {
+                                parent_node.*.next = .{ .children = .empty };
+                                try parent_node.*.next.children.put(allocator, movementTupleToCombo(item), new_node);
+                            },
+                            .character => {},
+                            .children => |*map| try map.put(allocator, movementTupleToCombo(item), new_node),
+                            .leaf => unreachable,
+                        }
+
+                        parent_node.* = new_node;
+                    }
                 } else @compileError(std.fmt.comptimePrint("invalid type: {}", .{@TypeOf(item)}));
             }
         }
     }
 
-    var state_var: usize = 1;
-    try writer.print("pub fn {s}(state: *DispatchState, key: u16, command_handlers: anytype) DispatchResult {{\n", .{dispatch_function_name});
+    std.debug.print("{f}\n", .{root});
+
+    try writer.print("pub fn {s}(state: anytype, key: u16, command_handlers: anytype) DispatchResult {{\n", .{dispatch_function_name});
 
     for (0..1) |_| _ = try writer.write("    ");
     _ = try writer.write("switch (state.state) {\n");
 
-    try generate_zig_code(writer, &root, &state_var, 2);
+    try generate_zig_code(writer, &root, 2);
 
     for (0..2) |_| _ = try writer.write("    ");
     _ = try writer.write("else => unreachable,\n");
@@ -194,88 +317,81 @@ fn generate(writer: *std.Io.Writer, dispatch_function_name: []const u8, comptime
     for (0..1) |_| _ = try writer.write("    ");
     _ = try writer.write("state.state = 0;\n");
     for (0..1) |_| _ = try writer.write("    ");
+    _ = try writer.write("state.character_count = 0;\n");
+    for (0..1) |_| _ = try writer.write("    ");
+    _ = try writer.write("state.movement = null;\n");
+    for (0..1) |_| _ = try writer.write("    ");
     _ = try writer.write("return .dispatched_command;\n");
 
     _ = try writer.write("}\n");
 }
 
-fn generate_zig_code(writer: *std.Io.Writer, node: *KeyNode, state_var: *usize, i: usize) !void {
-    if (node.leaf != null) {
-        for (0..i) |_| _ = try writer.write("    ");
-        try writer.print("{s}();\n", .{node.leaf.?});
-        return;
-    }
-
-    var iter = node.keys.iterator();
-    if (node.leaf_character) {
-        const this_state = state_var.*;
-
-        for (0..i) |_| _ = try writer.write("    ");
-        try writer.print("{} => {{ state.characters[state.character_count] = key; state.character_count += 1; state.state = {}; return .waiting; }},\n", .{ node.state, this_state });
-
-        node.state = this_state;
-        state_var.* += 1;
-    }
+fn generate_zig_code(writer: *std.Io.Writer, node: *KeyNode1, i: usize) !void {
+    if (node.generated) return;
+    node.generated = true;
 
     for (0..i) |_| _ = try writer.write("    ");
-    try writer.print("{} => switch (key) {{\n", .{node.state});
+    try writer.print("{} => ", .{node.state});
 
-    while (iter.next()) |entry| {
-        for (0..i + 1) |_| _ = try writer.write("    ");
-        const k = entry.key_ptr.*;
-        if (k.ctrl > 0 or k.shift > 0 or k.alt > 0) {
-            try writer.print("0b{}{}{}0000000 | ", .{ k.alt, k.shift, k.ctrl });
-        }
-        try writer.print("'{c}' => ", .{@as(u8, k.char)});
-
-        if (entry.value_ptr.*.leaf) |leaf| {
-            if (entry.value_ptr.*.leaf_movement) |movement_| {
-                try writer.print("command_handlers.{s}(.{t}),\n", .{ leaf, movement_ });
-            } else if (entry.value_ptr.*.leaf_character) {
-                const this_state = state_var.*;
-                try writer.print("{{ state.state = {}; return .waiting; }},\n", .{this_state});
-
-                entry.value_ptr.*.state = this_state;
-                state_var.* += 1;
+    switch (node.next) {
+        .invalid => unreachable,
+        .leaf => |value| try writer.print("command_handlers.{s}(state),\n", .{value}),
+        .character => |value| {
+            if (value.?.next == .leaf) {
+                value.?.generated = true;
+                try writer.print("{{ state.characters[state.character_count] = key; state.character_count += 1; command_handlers.{s}(state); }},\n", .{value.?.next.leaf});
             } else {
-                try writer.print("command_handlers.{s}(null),\n", .{leaf});
+                try writer.print("{{ state.characters[state.character_count] = key; state.character_count += 1; state.state = {}; return .waiting; }},\n", .{value.?.state});
             }
-        } else {
-            const this_state = state_var.*;
-            try writer.print("{{ state.state = {}; return .waiting; }},\n", .{this_state});
+        },
 
-            entry.value_ptr.*.state = this_state;
-            state_var.* += 1;
-        }
-    }
+        .children => |value| {
+            try writer.print("switch (key) {{\n", .{});
 
-    for (0..i + 1) |_| _ = try writer.write("    ");
-    _ = try writer.write("else => return .not_mapped,\n");
-    for (0..i) |_| _ = try writer.write("    ");
-    _ = try writer.write("},\n");
-
-    iter = node.keys.iterator();
-    while (iter.next()) |entry| {
-        if (entry.value_ptr.*.leaf_character) {
-            if (entry.value_ptr.*.leaf != null) {
-                for (0..i) |_| _ = try writer.write("    ");
-
-                if (entry.value_ptr.*.leaf_movement) |movement_| {
-                    try writer.print("{} => command_handlers.{s}(.{t}, key),\n", .{ entry.value_ptr.*.state, entry.value_ptr.*.leaf.?, movement_ });
-                } else {
-                    try writer.print("{} => command_handlers.{s}(key),\n", .{ entry.value_ptr.*.state, entry.value_ptr.*.leaf.? });
+            var iter = value.iterator();
+            while (iter.next()) |entry| {
+                for (0..i + 1) |_| _ = try writer.write("    ");
+                const k = entry.key_ptr.*;
+                if (k.ctrl > 0 or k.shift > 0 or k.alt > 0) {
+                    try writer.print("0b{}{}{}0000000 | ", .{ k.alt, k.shift, k.ctrl });
                 }
 
-                // try generate_zig_code(writer, entry.value_ptr.*, state_var, i);
+                if (entry.value_ptr.*.movement) |move| {
+                    if (entry.value_ptr.*.next == .leaf) {
+                        entry.value_ptr.*.generated = true;
+                        try writer.print("'{c}' => {{ state.movement = .{t}; command_handlers.{s}(state); }},\n", .{ @as(u8, k.char), move, entry.value_ptr.*.next.leaf });
+                    } else {
+                        try writer.print("'{c}' => {{ state.movement = .{t}; state.state = {}; return .waiting; }},\n", .{ @as(u8, k.char), move, entry.value_ptr.*.state });
+                    }
+                } else {
+                    if (entry.value_ptr.*.next == .leaf) {
+                        entry.value_ptr.*.generated = true;
+                        try writer.print("'{c}' => command_handlers.{s}(state),\n", .{ @as(u8, k.char), entry.value_ptr.*.next.leaf });
+                    } else {
+                        try writer.print("'{c}' => {{ state.state = {}; return .waiting; }},\n", .{ @as(u8, k.char), entry.value_ptr.*.state });
+                    }
+                }
             }
 
-            if (entry.value_ptr.*.leaf == null and entry.value_ptr.*.leaf_movement == null) {
-                try generate_zig_code(writer, entry.value_ptr.*, state_var, i);
+            for (0..i + 1) |_| _ = try writer.write("    ");
+            _ = try writer.write("else => return .not_mapped,\n");
+
+            for (0..i) |_| _ = try writer.write("    ");
+            try writer.print("}},\n", .{});
+        },
+    }
+
+    switch (node.next) {
+        .invalid => unreachable,
+        .leaf => {},
+        .character => |value| {
+            try generate_zig_code(writer, value.?, i);
+        },
+        .children => |value| {
+            var iter = value.iterator();
+            while (iter.next()) |entry| {
+                try generate_zig_code(writer, entry.value_ptr.*, i);
             }
-        } else {
-            if (entry.value_ptr.*.leaf == null and entry.value_ptr.*.leaf_movement == null) {
-                try generate_zig_code(writer, entry.value_ptr.*, state_var, i);
-            }
-        }
+        },
     }
 }

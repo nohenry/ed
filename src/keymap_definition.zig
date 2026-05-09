@@ -13,15 +13,6 @@ pub const normal_keymap_definition = .{
     .{ 'o', "commandEnterInsertModeBelowLine" },
     .{ 'v', "commandEnterVisualMode" },
 
-    // .{ 'r', character, "commandReplace" },
-    // .{ 'f', character, "commandFindNext" },
-    // .{ 'F', character, "commandFindPrevious" },
-    // .{ 't', character, "commandFindTillNext" },
-    // .{ 'T', character, "commandFindTillPrevious" },
-    // .{ 'T', character, "commandFindTillPrevious" },
-    // .{ ';', "commandFindAgainNext" },
-    // .{ ',', "commandFindAgainPrev" },
-
     .{ 'd', movement, "commandDeleteMovement" },
     .{ 'd', 'd', "commandDeleteLine" },
 
@@ -32,8 +23,6 @@ pub const normal_keymap_definition = .{
     .{ .{ ctrl, 'u' }, "commandMoveUpHalfView" },
     .{ .{ ctrl, 'd' }, "commandMoveDownHalfView" },
 
-    .{ 'z', character, 't', movement, "fjkldsjf" },
-
     .{ movement, "commandMove" },
 };
 
@@ -41,15 +30,6 @@ pub const visual_keymap_definition = .{
     .{ 'd', "commandVisualDelete" },
     .{ 'c', "commandVisualChange" },
     .{ 'x', "commandDeleteUnder" },
-
-    .{ 'r', character, "commandReplace" },
-    .{ 'f', character, "commandFindNext" },
-    .{ 'F', character, "commandFindPrevious" },
-    .{ 't', character, "commandFindTillNext" },
-    .{ 'T', character, "commandFindTillPrevious" },
-    .{ 'T', character, "commandFindTillPrevious" },
-    .{ ';', "commandFindAgainNext" },
-    .{ ',', "commandFindAgainPrev" },
 
     .{ '*', "commandVisualSearch" },
     .{ '#', "commandVisualSearchReverse" },

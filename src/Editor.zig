@@ -8,6 +8,8 @@ comptime {
 
 pub const Self = @This();
 
+const DispatchState = keymap.DispatchState(Movement);
+
 io: std.Io,
 allocator: std.mem.Allocator,
 scratch: std.heap.ArenaAllocator,
@@ -24,12 +26,14 @@ mode: enum {
 
 saved_insert_node: ?*ed.Rope.Node = null,
 
-key_dispatch_state: keymap.DispatchState = .{},
+key_dispatch_state: DispatchState = .{},
 
 matcher: ?ed.Rope.Matcher = null,
 
 last_find: ?u32 = null,
-last_find_kind: enum { to, till } = .to,
+last_find_kind: ToTill = .to,
+
+pub const ToTill = enum { to, till };
 
 pub fn init(io: std.Io, allocator: std.mem.Allocator) Self {
     return .{
@@ -232,20 +236,20 @@ pub fn adjustViewToCursorPosition(self: *Self, cursor_position: usize) void {
 
 // ********************* NORMAL COMMANDS *********************
 
-pub fn commandEnterInsertMode(self: *Self, movement: ?Movement) void {
-    _ = movement;
+pub fn commandEnterInsertMode(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
     self.mode = .insert;
 }
 
-pub fn commandEnterInsertModeAppend(self: *Self, movement: ?Movement) void {
-    _ = movement;
+pub fn commandEnterInsertModeAppend(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
     self.mode = .insert;
     self.view.cursor.head += 1;
     self.view.cursor.tail += 1;
 }
 
-pub fn commandEnterInsertModeStartOfLine(self: *Self, movement: ?Movement) void {
-    _ = movement;
+pub fn commandEnterInsertModeStartOfLine(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
     self.mode = .insert;
     const document = self.documents.getPtr(self.current_document) orelse return;
     const line_range = document.rope.getLineRange(self.view.cursor.head) orelse return;
@@ -253,8 +257,8 @@ pub fn commandEnterInsertModeStartOfLine(self: *Self, movement: ?Movement) void 
     self.view.cursor.tail = line_range[0];
 }
 
-pub fn commandEnterInsertModeEndOfLine(self: *Self, movement: ?Movement) void {
-    _ = movement;
+pub fn commandEnterInsertModeEndOfLine(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
     self.mode = .insert;
     const document = self.documents.getPtr(self.current_document) orelse return;
     const line_range = document.rope.getLineRange(self.view.cursor.head) orelse return;
@@ -262,8 +266,8 @@ pub fn commandEnterInsertModeEndOfLine(self: *Self, movement: ?Movement) void {
     self.view.cursor.tail = line_range[1] -| 1;
 }
 
-pub fn commandEnterInsertModeAboveLine(self: *Self, movement: ?Movement) void {
-    _ = movement;
+pub fn commandEnterInsertModeAboveLine(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
     self.mode = .insert;
     const document = self.documents.getPtr(self.current_document) orelse return;
 
@@ -274,8 +278,8 @@ pub fn commandEnterInsertModeAboveLine(self: *Self, movement: ?Movement) void {
     self.view.cursor.tail = line_range[0];
 }
 
-pub fn commandEnterInsertModeBelowLine(self: *Self, movement: ?Movement) void {
-    _ = movement;
+pub fn commandEnterInsertModeBelowLine(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
     self.mode = .insert;
     const document = self.documents.getPtr(self.current_document) orelse return;
 
@@ -286,14 +290,16 @@ pub fn commandEnterInsertModeBelowLine(self: *Self, movement: ?Movement) void {
     self.view.cursor.tail = line_range[1];
 }
 
-pub fn commandReplace(self: *Self, character: u16) void {
+pub fn commandReplace(self: *Self, dispatch: *DispatchState) void {
+    const character = dispatch.characters[0];
     const document = self.documents.getPtr(self.current_document) orelse return;
     const ordered = self.view.cursor.getOrdered();
     _ = document.rope.deleteRange(ordered[0], ordered[1] + 1) orelse return;
     _ = document.rope.insertSplat(ordered[0], @truncate(character), ordered[1] - ordered[0] + 1);
 }
 
-pub fn commandFindNext(self: *Self, character: u32) void {
+pub fn commandFindNext(self: *Self, dispatch: *DispatchState) void {
+    const character = dispatch.characters[0];
     const document = self.documents.getPtr(self.current_document) orelse return;
     const view_end = document.rope.add(
         self.view.start_position,
@@ -317,7 +323,8 @@ pub fn commandFindNext(self: *Self, character: u32) void {
     if (found) self.setCursor(current_offset);
 }
 
-pub fn commandFindPrevious(self: *Self, character: u32) void {
+pub fn commandFindPrevious(self: *Self, dispatch: *DispatchState) void {
+    const character = dispatch.characters[0];
     const document = self.documents.getPtr(self.current_document) orelse return;
     var current_offset = self.view.cursor.head;
     self.last_find = character;
@@ -336,7 +343,8 @@ pub fn commandFindPrevious(self: *Self, character: u32) void {
     if (found) self.setCursor(current_offset);
 }
 
-pub fn commandFindTillNext(self: *Self, character: u32) void {
+pub fn commandFindTillNext(self: *Self, dispatch: *DispatchState) void {
+    const character = dispatch.characters[0];
     const document = self.documents.getPtr(self.current_document) orelse return;
     const view_end = document.rope.add(
         self.view.start_position,
@@ -360,7 +368,8 @@ pub fn commandFindTillNext(self: *Self, character: u32) void {
     if (found and current_offset > 0) self.setCursor(current_offset - 1);
 }
 
-pub fn commandFindTillPrevious(self: *Self, character: u32) void {
+pub fn commandFindTillPrevious(self: *Self, dispatch: *DispatchState) void {
+    const character = dispatch.characters[0];
     const document = self.documents.getPtr(self.current_document) orelse return;
     var current_offset = self.view.cursor.head;
     self.last_find = character;
@@ -379,8 +388,8 @@ pub fn commandFindTillPrevious(self: *Self, character: u32) void {
     if (found and current_offset + 1 < document.rope.len) self.setCursor(current_offset + 1);
 }
 
-pub fn commandFindAgainNext(self: *Self, movement: ?Movement) void {
-    _ = movement;
+pub fn commandFindAgainNext(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
     if (self.last_find) |character| {
         switch (self.last_find_kind) {
             .to => self.commandFindNext(character),
@@ -389,8 +398,8 @@ pub fn commandFindAgainNext(self: *Self, movement: ?Movement) void {
     }
 }
 
-pub fn commandFindAgainPrev(self: *Self, movement: ?Movement) void {
-    _ = movement;
+pub fn commandFindAgainPrev(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
     if (self.last_find) |character| {
         switch (self.last_find_kind) {
             .to => self.commandFindPrevious(character),
@@ -399,13 +408,13 @@ pub fn commandFindAgainPrev(self: *Self, movement: ?Movement) void {
     }
 }
 
-pub fn commandEnterVisualMode(self: *Self, movement: ?Movement) void {
-    _ = movement;
+pub fn commandEnterVisualMode(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
     self.mode = .visual;
 }
 
-pub fn commandDeleteMovement(self: *Self, movement: ?Movement) void {
-    const movement_result = self.calculateKeyMovement(movement.?, .delete) orelse return;
+pub fn commandDeleteMovement(self: *Self, dispatch: *DispatchState) void {
+    const movement_result = self.calculateKeyMovement(dispatch.movement.?, dispatch.chars(), .delete) orelse return;
     const document = self.documents.getPtr(self.current_document) orelse return;
     _ = document.rope.deleteRange(movement_result.selection.tail, movement_result.selection.head);
 
@@ -414,22 +423,22 @@ pub fn commandDeleteMovement(self: *Self, movement: ?Movement) void {
     }
 }
 
-pub fn commandDeleteLine(self: *Self, movement: ?Movement) void {
-    _ = movement;
+pub fn commandDeleteLine(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
     _ = self;
     std.debug.print("Delte line\n", .{});
 }
 
-pub fn commandDeleteUnder(self: *Self, movement: ?Movement) void {
-    _ = movement;
+pub fn commandDeleteUnder(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
 
     const document = self.documents.getPtr(self.current_document) orelse return;
     const ordered = self.view.cursor.getOrdered();
     _ = document.rope.deleteRange(ordered[0], ordered[1]);
 }
 
-pub fn commandChangeMovement(self: *Self, movement: ?Movement) void {
-    const movement_result = self.calculateKeyMovement(movement.?, .delete) orelse return;
+pub fn commandChangeMovement(self: *Self, dispatch: *DispatchState) void {
+    const movement_result = self.calculateKeyMovement(dispatch.movement.?, dispatch.chars(), .delete) orelse return;
     const document = self.documents.getPtr(self.current_document) orelse return;
     _ = document.rope.deleteRange(movement_result.selection.tail, movement_result.selection.head);
 
@@ -439,22 +448,22 @@ pub fn commandChangeMovement(self: *Self, movement: ?Movement) void {
     self.mode = .insert;
 }
 
-pub fn commandMoveUpHalfView(self: *Self, movement: ?Movement) void {
-    _ = movement;
+pub fn commandMoveUpHalfView(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
 
     const line_difference = self.view.lines / 2;
     self.moveCursorUp(line_difference, true);
 }
 
-pub fn commandMoveDownHalfView(self: *Self, movement: ?Movement) void {
-    _ = movement;
+pub fn commandMoveDownHalfView(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
 
     const line_difference = self.view.lines / 2;
     self.moveCursorDown(line_difference, true);
 }
 
-pub fn commandMove(self: *Self, movement: ?Movement) void {
-    const movement_result = self.calculateKeyMovement(movement.?, .move);
+pub fn commandMove(self: *Self, dispatch: *DispatchState) void {
+    const movement_result = self.calculateKeyMovement(dispatch.movement.?, dispatch.chars(), .move);
     if (movement_result) |move| {
         self.setCursor(move.selection.head);
         self.view.max_column = move.max_column;
@@ -477,8 +486,8 @@ pub fn commandMove(self: *Self, movement: ?Movement) void {
 
 // ********************* VISUAL COMMANDS *********************
 
-pub fn commandVisualDelete(self: *Self, movement: ?Movement) void {
-    _ = movement;
+pub fn commandVisualDelete(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
 
     const document = self.documents.getPtr(self.current_document) orelse return;
     const ordered = self.view.cursor.getOrdered();
@@ -492,8 +501,8 @@ pub fn commandVisualDelete(self: *Self, movement: ?Movement) void {
     self.mode = .normal;
 }
 
-pub fn commandVisualChange(self: *Self, movement: ?Movement) void {
-    _ = movement;
+pub fn commandVisualChange(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
 
     const document = self.documents.getPtr(self.current_document) orelse return;
     const ordered = self.view.cursor.getOrdered();
@@ -502,8 +511,8 @@ pub fn commandVisualChange(self: *Self, movement: ?Movement) void {
     self.mode = .insert;
 }
 
-pub fn commandVisualSearch(self: *Self, movement: ?Movement) void {
-    _ = movement;
+pub fn commandVisualSearch(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
 
     const document = self.documents.getPtr(self.current_document) orelse return;
 
@@ -537,8 +546,8 @@ pub fn commandVisualSearch(self: *Self, movement: ?Movement) void {
     }
 }
 
-pub fn commandVisualSearchReverse(self: *Self, movement: ?Movement) void {
-    _ = movement;
+pub fn commandVisualSearchReverse(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
 
     const document = self.documents.getPtr(self.current_document) orelse return;
 
@@ -572,8 +581,8 @@ pub fn commandVisualSearchReverse(self: *Self, movement: ?Movement) void {
     }
 }
 
-pub fn commandVisualSearchNext(self: *Self, movement: ?Movement) void {
-    _ = movement;
+pub fn commandVisualSearchNext(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
 
     const document = self.documents.getPtr(self.current_document) orelse return;
 
@@ -594,8 +603,8 @@ pub fn commandVisualSearchNext(self: *Self, movement: ?Movement) void {
     }
 }
 
-pub fn commandVisualSearchPrev(self: *Self, movement: ?Movement) void {
-    _ = movement;
+pub fn commandVisualSearchPrev(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
 
     const document = self.documents.getPtr(self.current_document) orelse return;
 
@@ -627,6 +636,13 @@ pub const Movement = enum {
     start_of_line,
     start_of_line_non_blank,
     end_of_line,
+
+    find_next,
+    find_prev,
+    find_till_next,
+    find_till_prev,
+    find_again_next,
+    find_again_prev,
 };
 
 pub const KeyMovement = struct {
@@ -638,20 +654,26 @@ pub const KeyMovement = struct {
 
 pub fn movementIsDefaultLinewise(movement: Movement) bool {
     return switch (movement) {
-        .left => false,
-        .right => false,
-        .up => true,
-        .down => true,
-        .word_forward => false,
-        .word_backward => false,
-        .word_end_forward => false,
-        .start_of_line => false,
-        .start_of_line_non_blank => false,
-        .end_of_line => false,
+        .up, .down => true,
+        .left,
+        .right,
+        .word_forward,
+        .word_backward,
+        .word_end_forward,
+        .start_of_line,
+        .start_of_line_non_blank,
+        .end_of_line,
+        .find_next,
+        .find_prev,
+        .find_till_next,
+        .find_till_prev,
+        .find_again_next,
+        .find_again_prev,
+        => false,
     };
 }
 
-pub fn calculateKeyMovement(self: *Self, movement: Movement, comptime purpose: enum { move, delete }) ?KeyMovement {
+pub fn calculateKeyMovement(self: *Self, movement: Movement, chars: []const u32, comptime purpose: enum { move, delete }) ?KeyMovement {
     const document = self.documents.getPtr(self.current_document) orelse return null;
 
     var result = KeyMovement{
@@ -805,8 +827,131 @@ pub fn calculateKeyMovement(self: *Self, movement: Movement, comptime purpose: e
             result.selection.head = line_range[1];
             result.max_column = 0;
         },
+        .find_next => {
+            const character = chars[0];
+            if (self.findCharacter(&document.rope, @truncate(character), true, .to)) |position| {
+                const line_range = document.rope.getLineRange(position).?; // right now this can't return null
+
+                result.cursor_position = position;
+                result.selection.tail = self.view.cursor.tail;
+                result.selection.head = position;
+
+                result.max_column = result.cursor_position - line_range[0];
+            }
+        },
+        .find_prev => {
+            const character = chars[0];
+            if (self.findCharacter(&document.rope, @truncate(character), false, .to)) |position| {
+                const line_range = document.rope.getLineRange(position).?; // right now this can't return null
+
+                result.cursor_position = position;
+                result.selection.tail = self.view.cursor.tail;
+                result.selection.head = position;
+
+                result.max_column = result.cursor_position - line_range[0];
+            }
+        },
+        .find_till_next => {
+            const character = chars[0];
+            if (self.findCharacter(&document.rope, @truncate(character), true, .till)) |position| {
+                const line_range = document.rope.getLineRange(position).?; // right now this can't return null
+
+                result.cursor_position = position;
+                result.selection.tail = self.view.cursor.tail;
+                result.selection.head = position;
+
+                result.max_column = result.cursor_position - line_range[0];
+            }
+        },
+        .find_till_prev => {
+            const character = chars[0];
+            if (self.findCharacter(&document.rope, @truncate(character), false, .till)) |position| {
+                const line_range = document.rope.getLineRange(position).?; // right now this can't return null
+
+                result.cursor_position = position;
+                result.selection.tail = self.view.cursor.tail;
+                result.selection.head = position;
+
+                result.max_column = result.cursor_position - line_range[0];
+            }
+        },
+        .find_again_next => {
+            if (self.last_find) |lf| {
+                if (self.findCharacter(&document.rope, @truncate(lf), true, self.last_find_kind)) |position| {
+                    const line_range = document.rope.getLineRange(position).?; // right now this can't return null
+
+                    result.cursor_position = position;
+                    result.selection.tail = self.view.cursor.tail;
+                    result.selection.head = position;
+
+                    result.max_column = result.cursor_position - line_range[0];
+                }
+            }
+        },
+        .find_again_prev => {
+            if (self.last_find) |lf| {
+                if (self.findCharacter(&document.rope, @truncate(lf), false, self.last_find_kind)) |position| {
+                    const line_range = document.rope.getLineRange(position).?; // right now this can't return null
+
+                    result.cursor_position = position;
+                    result.selection.tail = self.view.cursor.tail;
+                    result.selection.head = position;
+
+                    result.max_column = result.cursor_position - line_range[0];
+                }
+            }
+        },
     }
     return result;
+}
+
+pub fn findCharacter(self: *Self, rope: *ed.Rope, character: u8, comptime forwards: bool, kind: ToTill) ?usize {
+    self.last_find = character;
+    self.last_find_kind = kind;
+
+    const view_end = rope.add(
+        self.view.start_position,
+        ed.Rope.Coordinate{ .line = self.view.lines + 1, .column = 0 },
+        ed.Rope.Position,
+    );
+    var current_offset = if (forwards)
+        @min(self.view.cursor.head + 1, rope.len)
+    else
+        self.view.cursor.head -| 1;
+    var node, var node_offset = rope.indexNode(current_offset) orelse return null;
+
+    var found = false;
+    if (forwards) {
+        while (current_offset < view_end) : (current_offset += 1) {
+            if (node.string.items[node_offset] == @as(u8, @truncate(character))) {
+                found = true;
+                break;
+            }
+            node, node_offset = node.nextNodeChar(node_offset) orelse break;
+        }
+    } else {
+        while (current_offset > 0) : (current_offset -= 1) {
+            if (node.string.items[node_offset] == @as(u8, @truncate(character))) {
+                found = true;
+                break;
+            }
+            node, node_offset = node.previousNodeChar(node_offset) orelse break;
+        }
+    }
+
+    if (found) {
+        if (kind == .till) {
+            if (forwards) {
+                return if (current_offset > 0) current_offset - 1 else null;
+            } else {
+                return if (current_offset + 1 < rope.len) current_offset + 1 else null;
+            }
+        }
+
+        return current_offset;
+    } else {
+        return null;
+    }
 }
 
 pub fn calculateCursorViewCoords(self: *Self) ed.Rope.Coordinate {
