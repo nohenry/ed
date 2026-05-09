@@ -127,6 +127,8 @@ const KeyNode1 = struct {
     pub fn formatImpl(self: *const KeyNode1, w: *std.Io.Writer, indent: usize) !void {
         for (0..indent) |_| _ = try w.writeAll("   ");
 
+        if (self.movement) |m| try w.print("Has movement: {}  ", .{m});
+
         switch (self.next) {
             .invalid => try w.print("Node Invalid\n", .{}),
             .leaf => |l| try w.print("Node Leaf '{s}' {*}\n", .{ l, self }),
@@ -192,11 +194,14 @@ fn generate(writer: *std.Io.Writer, dispatch_function_name: []const u8, comptime
                         char_node.* = .{ .state = char_node_state, .next = .invalid };
                         next_state += 1;
 
-                        inline for (std.meta.fields(Movement)) |field| {
-                            const movement_ = movementKeysCombo(@enumFromInt(field.value));
-                            const needs_char = movementKeysNeedsChar(@enumFromInt(field.value));
+                        for (these_nodes) |parent_node| {
+                            const movement_state = next_state;
+                            next_state += 1;
 
-                            for (these_nodes) |parent_node| {
+                            inline for (std.meta.fields(Movement)) |field| {
+                                const movement_ = movementKeysCombo(@enumFromInt(field.value));
+                                const needs_char = movementKeysNeedsChar(@enumFromInt(field.value));
+
                                 const result = switch (parent_node.next) {
                                     .invalid => blk: {
                                         parent_node.next = .{ .children = .empty };
@@ -208,9 +213,6 @@ fn generate(writer: *std.Io.Writer, dispatch_function_name: []const u8, comptime
                                 };
 
                                 if (!result.found_existing) {
-                                    const movement_state = next_state;
-                                    next_state += 1;
-
                                     const new_node = try allocator.create(KeyNode1);
                                     new_node.* = .{ .state = movement_state, .movement = @enumFromInt(field.value), .next = if (needs_char) .{ .character = char_node } else .invalid };
                                     result.value_ptr.* = new_node;
@@ -329,6 +331,11 @@ fn generate(writer: *std.Io.Writer, dispatch_function_name: []const u8, comptime
 fn generate_zig_code(writer: *std.Io.Writer, node: *KeyNode1, i: usize) !void {
     if (node.generated) return;
     node.generated = true;
+
+    switch (node.next) {
+        .character => |value| if (value != null and value.?.generated) return,
+        else => {}
+    }
 
     for (0..i) |_| _ = try writer.write("    ");
     try writer.print("{} => ", .{node.state});
