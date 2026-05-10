@@ -699,16 +699,21 @@ pub const GrowableString = struct {
 pub const Node = struct {
     pub const String = GrowableString;
 
+    id: usize,
     string: String,
     total_length: usize,
     parent: ?*Node = null,
     left: ?*Node = null,
     right: ?*Node = null,
 
+    var next_id: usize = 0;
+
     pub inline fn init(node: *Node, left: ?*Node, right: ?*Node) *Node {
         if (left) |l| l.parent = node;
         if (right) |r| r.parent = node;
+        defer next_id += 1;
         node.* = .{
+            .id = next_id,
             .string = .empty,
             .total_length = (if (left) |l| l.total_length else 0) + if (right) |r| r.total_length else 0,
             .left = left,
@@ -789,6 +794,20 @@ pub const Node = struct {
             current = current.nextLeaf() orelse return null;
         }
         return .{ current, current_node_offset };
+    }
+
+    /// Get the next character and its node, relative to the given node, and character offset of that node.
+    /// node must be a leaf node.
+    /// node_offset must be a valid offset into the string of node.
+    pub fn nthNextNodeChar(node: *Node, node_offset: usize, n: usize) ?struct { *Node, usize } {
+        std.debug.assert(node.isLeaf());
+        var current = node;
+        var offset = node_offset;
+
+        for (0..n) |_| {
+            current, offset = node.nextNodeChar(offset) orelse return null;
+        }
+        return .{ current, offset };
     }
 
     /// Get the previous character and its node, relative to the given node, and character offset of that node.
@@ -1337,7 +1356,9 @@ pub fn loadEmpty(self: *Self) void {
 
 pub fn loadString(self: *Self, string: []const u8) void {
     const node = self.node_pool.create(self.allocator) catch @panic("OOM");
+    defer Node.next_id += 1;
     node.* = .{
+        .id = Node.next_id,
         .string = .initReadonly(string),
         .total_length = string.len,
     };
@@ -1353,7 +1374,8 @@ pub fn createNode(self: *Self, left: ?*Node, right: ?*Node) *Node {
 
 pub fn createLeafNode(self: *Self, string: Node.String) *Node {
     const node = self.node_pool.create(self.allocator) catch @panic("OOM");
-    node.* = .{ .string = string, .total_length = string.items.len };
+    defer Node.next_id += 1;
+    node.* = .{ .id = Node.next_id, .string = string, .total_length = string.items.len };
     return node;
 }
 
@@ -1472,6 +1494,34 @@ pub fn insertString(self: *Self, index: usize, string: []const u8) *Node {
 /// String is copied, and an allocated node is inserted.
 ///
 /// The root node must not be empty.
+pub fn insertGrowableString(self: *Self, index: usize, string: GrowableString) *Node {
+    std.debug.assert(self.root != null);
+    const current = self.root.?;
+
+    defer self.len += string.items.len;
+    if (index == 0) {
+        return self.prependString(string);
+    } else if (index == self.len) {
+        return self.appendString(string);
+    }
+
+    var lhs, var rhs = self.split(current, index);
+    const leaf_node = self.createLeafNode(string);
+    if (self.balance_state % 2 == 0) {
+        lhs = self.createNode(lhs, leaf_node);
+    } else {
+        rhs = self.createNode(leaf_node, rhs);
+    }
+    self.balance_state += 1;
+    self.root = self.createNode(lhs, rhs);
+
+    return leaf_node;
+}
+
+/// Inserts the given string at the given index.
+/// String is copied, and an allocated node is inserted.
+///
+/// The root node must not be empty.
 pub fn insertSplat(self: *Self, index: usize, char: u8, count: usize) *Node {
     std.debug.assert(self.root != null);
     const current = self.root.?;
@@ -1554,22 +1604,42 @@ fn appendString(self: *Self, string: Node.String) *Node {
 }
 
 /// start is inclusive, end is exclusive
-pub fn deleteRange(self: *Self, start: usize, end: usize) ?struct { *Node, *Node } {
+pub fn deleteRange(self: *Self, start: usize, end: usize) ?struct { *Node, *Node, *Node } {
     if (self.root == null) return null;
     const lhs = self.split(self.root.?, start);
     const rhs = self.split(lhs[1], end - start);
-    self.root = self.createNode(lhs[0], rhs[1]);
 
     lhs[1].parent = null;
     rhs[0].parent = null;
     var iter_ = self.nodeIterNode(lhs[1]);
-    dumpNodeToFile(lhs[1], "bruh.dot") catch @panic("fldsjf");
 
     while (iter_.next()) |leaf| {
         std.debug.print("leaf: {s}\n", .{leaf.string.items});
     }
+
+    self.recycleNodes(rhs[0], true);
+
+    self.root = self.createNode(lhs[0], rhs[1]);
+    var current = rhs[1];
+    while (!current.isLeaf()) {
+        current = current.left.?;
+    }
+
     self.len -= end - start;
-    return .{ lhs[1], rhs[0] };
+    return .{ lhs[1], rhs[0], current };
+}
+
+pub fn recycleNodes(self: *Self, root: *Node, comptime include_leafs: bool) void {
+    if (root.left) |l| self.recycleNodes(l, include_leafs);
+    if (root.right) |r| self.recycleNodes(r, include_leafs);
+
+    if (include_leafs) {
+        self.node_pool.destroy(root);
+    } else {
+        if (!root.isLeaf()) {
+            self.node_pool.destroy(root);
+        }
+    }
 }
 
 pub fn dumpNodeToFile(node: *Node, filename: []const u8) !void {
@@ -1587,6 +1657,28 @@ pub fn dumpNodeToFile(node: *Node, filename: []const u8) !void {
     file.close(io.io());
 }
 
+pub fn dumpGraphToFile(self: *Self, filename: []const u8) !void {
+    var io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+
+    var file = try std.Io.Dir.createFile(std.Io.Dir.cwd(), io.io(), filename, .{});
+    var buffer: [4096]u8 = undefined;
+    var writer = file.writer(io.io(), &buffer);
+
+    try writer.interface.print("digraph {{\n", .{});
+    var next_id = try dumpGraphImpl(self.root.?, 0, &writer.interface);
+
+    var current = self.node_pool.free_list.first;
+    while (current) |node| {
+        try writer.interface.print("node_{} [label=\"recycled {*}\"];\n", .{ next_id, node });
+        next_id += 1;
+        current = current.?.next;
+    }
+    try writer.interface.print("}}\n", .{});
+
+    try writer.interface.flush();
+    file.close(io.io());
+}
+
 pub fn dumpGraph(self: *Self, writer: *std.Io.Writer) !void {
     try writer.print("digraph {{\n", .{});
     _ = try dumpGraphImpl(self.root.?, 0, writer);
@@ -1596,10 +1688,10 @@ pub fn dumpGraph(self: *Self, writer: *std.Io.Writer) !void {
 pub fn dumpGraphImpl(node: *Node, id: usize, writer: *std.Io.Writer) !usize {
     const my_id = id;
     if (node.isLeaf()) {
-        try writer.print("node{} [label=\"{}\\n", .{ my_id, node.total_length });
+        try writer.print("node{} [label=\"[{}]\\n{}\\n", .{ my_id, node.id, node.total_length });
         for (node.string.items) |c| {
             switch (c) {
-                '\n' => try writer.writeAll("\\n"),
+                '\n' => try writer.writeAll("\\l"),
                 '"' => try writer.writeAll("\\\\"),
                 else => try writer.writeByte(c),
             }
@@ -1610,7 +1702,7 @@ pub fn dumpGraphImpl(node: *Node, id: usize, writer: *std.Io.Writer) !usize {
     } else {
         var next_id = id;
 
-        try writer.print("node{} [label=\"{}\"];\n", .{ my_id, node.total_length });
+        try writer.print("node{} [label=\"[{}]\n{}\"];\n", .{ my_id, node.id, node.total_length });
 
         if (node.left) |left| {
             next_id = try dumpGraphImpl(left, id + 1, writer);

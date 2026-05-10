@@ -30,6 +30,11 @@ pub const normal_keymap_definition = .{
     .{ .{ ctrl, 'u' }, "commandMoveUpHalfView" },
     .{ .{ ctrl, 'd' }, "commandMoveDownHalfView" },
 
+
+    .{ '>', "commandIndentIn" },
+    .{ '<', "commandIndentOut" },
+
+
     .{ movement, "commandMove" },
 };
 
@@ -47,6 +52,9 @@ pub const visual_keymap_definition = .{
 
     .{ .{ ctrl, 'u' }, "commandMoveUpHalfView" },
     .{ .{ ctrl, 'd' }, "commandMoveDownHalfView" },
+
+    .{ '>', "commandIndentIn" },
+    .{ '<', "commandIndentOut" },
 
     .{ movement, "commandMove" },
 };

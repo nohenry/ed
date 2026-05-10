@@ -663,6 +663,291 @@ pub fn commandMove(self: *Self, dispatch: *DispatchState) void {
     }
 }
 
+pub fn commandIndentIn(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
+
+    const document = self.documents.getPtr(self.current_document) orelse return;
+    const ordered = self.view.cursor.getOrdered();
+
+    const start_range = document.rope.getLineRange(ordered[0]) orelse .{ 0, 0 };
+    _ = document.rope.insertString(start_range[0], "    ");
+
+    const end_range = if (ordered[1] != ordered[0])
+        document.rope.getLineRange(ordered[1] + 4) orelse .{ 0, 0 }
+    else {
+        self.view.cursor.head += 4;
+        self.view.cursor.tail += 4;
+        return;
+    };
+
+    if (start_range[0] == end_range[0]) {
+        self.view.cursor.head += 4;
+        self.view.cursor.tail += 4;
+        return;
+    }
+
+    var current_offset = start_range[0] + 4;
+    var node, var node_offset = document.rope.indexNode(current_offset) orelse return;
+    var increment_cursor: usize = 0;
+
+    while (current_offset < end_range[1] + increment_cursor - 4) : (current_offset += 1) {
+        switch (node.string.items[node_offset]) {
+            '\n' => {
+                const inserted_node = document.rope.insertString(current_offset + 1, "    ");
+                // this would have been the next node, before inserting
+                const inserted_node_next, const inserted_node_next_offset = inserted_node.nthNextNodeChar(0, 4) orelse @panic("unhandled");
+                current_offset += 4;
+                increment_cursor += 4;
+
+                node = inserted_node_next;
+                node_offset = inserted_node_next_offset;
+            },
+            else => {
+                const next_node, const next_node_offset = node.nextNodeChar(node_offset) orelse break;
+                node = next_node;
+                node_offset = next_node_offset;
+            },
+        }
+    }
+
+    if (self.view.cursor.head < self.view.cursor.tail) {
+        if (self.mode == .visual_line) {
+            self.view.cursor.tail += increment_cursor + 4;
+        } else {
+            self.view.cursor.head += 4;
+            self.view.cursor.tail += increment_cursor + 4;
+        }
+    } else {
+        if (self.mode == .visual_line) {
+            self.view.cursor.head += increment_cursor + 4;
+        } else {
+            self.view.cursor.tail += 4;
+            self.view.cursor.head += increment_cursor + 4;
+        }
+    }
+}
+
+pub fn commandIndentOut(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
+    const document = self.documents.getPtr(self.current_document) orelse return;
+
+    const ordered = self.view.cursor.getOrdered();
+    const start_range = document.rope.getLineRange(ordered[0]) orelse .{ 0, 0 };
+    const end_range = if (ordered[1] != ordered[0])
+        document.rope.getLineRange(ordered[1]) orelse .{ 0, 0 }
+    else
+        start_range;
+
+    var range_iterator = document.rope.rangeIter(start_range[0], end_range[1]);
+    var sb = ed.Rope.GrowableString.initCapacity(document.rope.allocator, ordered[1] - ordered[0]) catch @panic("OOM");
+
+    var start: usize = 0;
+    var skip_indent = true;
+    var indent: usize = 0;
+    var cursor_indent: usize = 0;
+    var first_indent: usize = 0;
+    var last_indent: usize = 0;
+    var characters_added: usize = 0;
+
+    document.rope.dumpGraphToFile("indentout.dot") catch @panic("flksdjlfsd");
+
+    while (range_iterator.next()) |slice| {
+        start = 0;
+
+        std.debug.print("Range: '{s}'\n", .{slice});
+        for (slice, 0..) |item, i| {
+            switch (item) {
+                '\n' => {
+                    std.debug.print("start skip {} {}\n", .{ start, i + 1 });
+                    sb.appendSlice(document.rope.allocator, slice[start .. i + 1]) catch @panic("OOM");
+                    indent = 0;
+                    skip_indent = true;
+                    start = i + 1;
+                },
+                else => {
+                    if (skip_indent) {
+                        if (item == ' ') indent += 1;
+                        if (item == '\t') indent += 4;
+
+                        if (indent >= 4) {
+                            skip_indent = false;
+                            start = i + 1;
+
+                            if (cursor_indent == 0) first_indent = indent else last_indent = indent;
+                            characters_added += indent;
+
+                            cursor_indent += 1;
+                        } else if (item != ' ') {
+                            skip_indent = false;
+                            start = i;
+
+                            if (cursor_indent == 0) first_indent = indent else last_indent = indent;
+                            characters_added += indent;
+
+                            cursor_indent += 1;
+                        }
+                    }
+                },
+            }
+        }
+
+        if (start < slice.len) {
+            sb.appendSlice(document.rope.allocator, slice[start..]) catch @panic("OOM");
+        }
+    }
+
+    _ = document.rope.deleteRange(start_range[0], end_range[1]).?;
+    _ = document.rope.insertGrowableString(start_range[0], sb);
+
+    if (self.view.cursor.head < self.view.cursor.tail) {
+        if (self.mode == .visual_line) {
+            self.view.cursor.head = start_range[0];
+            self.view.cursor.tail -= characters_added;
+        } else {
+            const new_head = @max(start_range[0], self.view.cursor.head -| first_indent);
+            self.view.cursor.tail -= characters_added;
+            self.view.cursor.head = new_head;
+        }
+    } else {
+        if (self.mode == .visual_line) {
+            self.view.cursor.tail = start_range[0];
+            self.view.cursor.head -= characters_added;
+        } else {
+            const new_tail = @max(start_range[0], self.view.cursor.tail -| first_indent);
+            self.view.cursor.head -= characters_added;
+            self.view.cursor.tail = new_tail;
+        }
+    }
+}
+
+// pub fn commandIndentOut1(self: *Self, dispatch: *DispatchState) void {
+//     _ = dispatch;
+
+//     const document = self.documents.getPtr(self.current_document) orelse return;
+//     const ordered = self.view.cursor.getOrdered();
+
+//     const start_range = document.rope.getLineRange(ordered[0]) orelse .{ 0, 0 };
+
+//     var current_offset = start_range[0];
+//     var node, var node_offset = document.rope.indexNode(current_offset) orelse return;
+
+//     var indent_level: usize = 0;
+//     while (current_offset < start_range[1] and indent_level < 4) : (current_offset += 1) {
+//         switch (node.string.items[node_offset]) {
+//             ' ' => indent_level += 1,
+//             '\t' => indent_level += 4,
+//             else => break,
+//         }
+
+//         node, node_offset = node.nextNodeChar(node_offset) orelse break;
+//     }
+
+//     _ = document.rope.deleteRange(start_range[0], current_offset);
+
+//     const end_range = if (ordered[1] != ordered[0])
+//         document.rope.getLineRange(ordered[1]) orelse .{ 0, 0 }
+//     else {
+//         self.view.cursor.head -|= indent_level;
+//         self.view.cursor.tail -|= indent_level;
+//         return;
+//     };
+
+//     if (start_range[0] == end_range[0]) {
+//         if (self.view.cursor.head < self.view.cursor.tail) {
+//             const new_head = @max(start_range[0], self.view.cursor.head -| indent_level);
+//             self.view.cursor.tail -|= indent_level;
+//             self.view.cursor.head = new_head;
+//         } else {
+//             const new_tail = @max(start_range[0], self.view.cursor.tail -| indent_level);
+//             self.view.cursor.head -|= indent_level;
+//             self.view.cursor.tail = new_tail;
+//         }
+//         return;
+//     }
+
+//     current_offset = start_range[1] - indent_level - 1;
+//     node, node_offset = document.rope.indexNode(current_offset) orelse return;
+
+//     var increment_cursor: usize = 0;
+//     var increment_end: usize = 0;
+
+//     var start_removing = false;
+//     var start: usize = 0;
+
+//     while (current_offset <= end_range[1] - increment_end) : (current_offset += 1) {
+//         {
+//             // const ind, const ind_off = document.rope.indexNode(current_offset) orelse return;
+//             // std.debug.print("thing: '{c}', '{c}'\n", .{node.string.items[node_offset], ind.string.items[ind_off]});
+//         }
+//         switch (node.string.items[node_offset]) {
+//             '\n' => {
+//                 start_removing = true;
+//                 start = current_offset + 1;
+//                 indent_level = 0;
+
+//                 const next_node, const next_node_offset = node.nextNodeChar(node_offset) orelse break;
+//                 node = next_node;
+//                 node_offset = next_node_offset;
+//             },
+//             else => |c| {
+//                 if (start_removing) {
+//                     if (c == ' ') indent_level += 1;
+//                     if (c == '\t') indent_level += 4;
+//                     if (indent_level >= 4) {
+//                         start_removing = false;
+
+//                         if (indent_level > node_offset) {
+//                             const next_node, const next_node_offset = node.nextNodeChar(node_offset) orelse break;
+//                             _, _, const split_node = document.rope.deleteRange(start, current_offset + 1) orelse break;
+//                             // document.rope.dumpGraphToFile("indentout.dot") catch @panic("flkjsdf");
+//                             std.debug.print("indent i ssmalelr {}\n", .{indent_level});
+
+//                             std.debug.print("{*} {} {} {} {*} {}   {*} {}\n", .{ node, node.string.items.len, node_offset, indent_level, split_node, split_node.string.items.len, next_node, next_node_offset });
+//                             // node = next_node;
+//                             // node_offset = next_node_offset;
+//                             node = split_node;
+//                             node_offset = 0;
+
+//                             if (next_node == split_node) {
+//                                 increment_cursor += indent_level;
+//                             }
+//                             increment_end += indent_level;
+//                             current_offset -= indent_level;
+//                             continue;
+//                         }
+
+//                         _ = document.rope.deleteRange(start, current_offset + 1);
+//                         increment_cursor += indent_level;
+//                         increment_end += indent_level;
+//                         node_offset -= indent_level;
+//                         current_offset -= indent_level;
+//                     } else if (c != ' ') {
+//                         start_removing = false;
+
+//                         if (current_offset > start) {
+//                             _ = document.rope.deleteRange(start, current_offset);
+//                             increment_cursor += indent_level;
+//                             increment_end += indent_level;
+//                             node_offset -= indent_level;
+//                             current_offset -= indent_level;
+//                         }
+//                     }
+//                 }
+
+//                 const next_node, const next_node_offset = node.nextNodeChar(node_offset) orelse break;
+//                 node = next_node;
+//                 node_offset = next_node_offset;
+//             },
+//         }
+//     }
+
+//     std.debug.print("shift in {}\n", .{increment_cursor});
+
+//     if (self.view.cursor.head < self.view.cursor.tail) {} else {
+//         self.view.cursor.head -= increment_cursor;
+//     }
+// }
+
 // ********************* VISUAL COMMANDS *********************
 
 pub fn commandVisualDelete(self: *Self, dispatch: *DispatchState) void {
