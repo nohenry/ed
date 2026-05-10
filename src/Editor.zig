@@ -122,6 +122,7 @@ pub fn handleInsertModeKeydown(self: *Self, event: ed.Event) void {
             var out: [4]u8 = undefined;
             const utf8_len = std.unicode.utf8Encode(@truncate(data.char), &out) catch @panic("invlaid utf8");
             node.appendSlice(self.allocator, out[0..utf8_len]) catch @panic("OOM");
+            document.rope.len += utf8_len;
             self.view.cursor.head += utf8_len;
             self.view.cursor.tail += utf8_len;
             self.view.max_column += utf8_len;
@@ -538,7 +539,7 @@ pub fn commandDeleteUnder(self: *Self, dispatch: *DispatchState) void {
 
     const document = self.documents.getPtr(self.current_document) orelse return;
     const ordered = self.view.cursor.getOrdered();
-    _ = document.rope.deleteRange(ordered[0], ordered[1]);
+    _ = document.rope.deleteRange(ordered[0], ordered[1] + 1);
 }
 
 pub fn commandChangeMovement(self: *Self, dispatch: *DispatchState) void {
@@ -751,8 +752,6 @@ pub fn commandIndentOut(self: *Self, dispatch: *DispatchState) void {
     var first_indent: usize = 0;
     var last_indent: usize = 0;
     var characters_added: usize = 0;
-
-    document.rope.dumpGraphToFile("indentout.dot") catch @panic("flksdjlfsd");
 
     while (range_iterator.next()) |slice| {
         start = 0;
@@ -970,9 +969,13 @@ pub fn commandVisualDelete(self: *Self, dispatch: *DispatchState) void {
         }
     } else {
         if (self.view.cursor.tail < self.view.cursor.head) {
+            const line_range = document.rope.getLineRange(self.view.cursor.tail) orelse return;
             self.view.cursor.head = self.view.cursor.tail;
+            self.view.max_column = self.view.cursor.tail - line_range[0];
         } else {
+            const line_range = document.rope.getLineRange(self.view.cursor.head) orelse return;
             self.view.cursor.tail = self.view.cursor.head;
+            self.view.max_column = self.view.cursor.head - line_range[0];
         }
     }
     self.mode = .normal;
@@ -1143,6 +1146,70 @@ pub fn commandVisualSearchPrev(self: *Self, dispatch: *DispatchState) void {
     }
 }
 
+pub fn commandVisualTextObjectInner(self: *Self, dispatch: *DispatchState) void {
+    const movement_result = self.calculateKeyMovement(.text_object_inner, dispatch.chars(), .move) orelse return;
+
+    const document = self.documents.getPtr(self.current_document) orelse return;
+
+    if (self.view.cursor.head < self.view.cursor.tail) {
+        self.adjustViewToCursorPosition(movement_result.selection.tail);
+    } else {
+        self.adjustViewToCursorPosition(movement_result.selection.head);
+    }
+
+    if (self.view.cursor.head != self.view.cursor.tail) {
+        if (self.view.cursor.head < self.view.cursor.tail) {
+            self.view.cursor.head = @min(self.view.cursor.head, movement_result.selection.tail);
+            self.view.cursor.tail = @max(self.view.cursor.tail, movement_result.selection.head);
+        } else {
+            self.view.cursor.tail = @min(self.view.cursor.tail, movement_result.selection.tail);
+            self.view.cursor.head = @max(self.view.cursor.head, movement_result.selection.head);
+        }
+    } else {
+        if (self.view.cursor.head < self.view.cursor.tail) {
+            self.view.cursor.head = movement_result.selection.head;
+            self.view.cursor.tail = movement_result.selection.tail;
+        } else {
+            self.view.cursor.tail = movement_result.selection.tail;
+            self.view.cursor.head = movement_result.selection.head;
+        }
+    }
+
+    switch (self.mode) {
+        .visual => {
+            const line_range = document.rope.getLineRange(self.view.cursor.head) orelse return;
+            // if (self.view.cursor.head < self.view.cursor.tail) {
+            self.view.max_column = self.view.cursor.head - line_range[0];
+        },
+        .visual_line => {
+            const line_range = document.rope.getLineRange(self.view.cursor.tail) orelse return;
+            if (self.view.cursor.head < self.view.cursor.tail) {
+                self.view.cursor.head = line_range[0];
+                if (self.view.cursor.tail > line_range[1]) {
+                    const end_line_range = document.rope.getLineRange(self.view.cursor.tail) orelse return;
+                    self.view.cursor.tail = end_line_range[1];
+                } else {
+                    self.view.cursor.tail = line_range[1];
+                }
+            } else {
+                self.view.cursor.tail = line_range[0];
+                if (self.view.cursor.head > line_range[1]) {
+                    const end_line_range = document.rope.getLineRange(self.view.cursor.head) orelse return;
+                    self.view.cursor.head = end_line_range[1];
+                } else {
+                    self.view.cursor.head = line_range[1];
+                }
+            }
+        },
+        else => unreachable,
+    }
+}
+
+pub fn commandVisualTextObjectOuter(self: *Self, dispatch: *DispatchState) void {
+    _ = self;
+    _ = dispatch;
+}
+
 pub const Movement = enum {
     left,
     right,
@@ -1161,6 +1228,27 @@ pub const Movement = enum {
     find_till_prev,
     find_again_next,
     find_again_prev,
+
+    text_object_inner,
+    text_object_outer,
+    // text_object_inner_word,
+    // text_object_outer_word,
+    // text_object_inner_WORD,
+    // text_object_outer_WORD,
+    // text_object_inner_bracket,
+    // text_object_outer_bracket,
+    // text_object_inner_paren,
+    // text_object_outer_paren,
+    // text_object_inner_triangle,
+    // text_object_outer_triangle,
+    // text_object_inner_brace,
+    // text_object_outer_brace,
+    // text_object_inner_quote,
+    // text_object_outer_quote,
+    // text_object_inner_single_quote,
+    // text_object_outer_single_quote,
+    // text_object_inner_tick,
+    // text_object_outer_tick,
 };
 
 pub const KeyMovement = struct {
@@ -1187,6 +1275,8 @@ pub fn movementIsDefaultLinewise(movement: Movement) bool {
         .find_till_prev,
         .find_again_next,
         .find_again_prev,
+        .text_object_inner,
+        .text_object_outer,
         => false,
     };
 }
@@ -1419,6 +1509,31 @@ pub fn calculateKeyMovement(self: *Self, movement: Movement, chars: []const u32,
                 }
             }
         },
+        .text_object_inner => {
+            const character = chars[0];
+            const textobject = ed.TextObject.fromChar(character) orelse return result;
+            switch (self.mode) {
+                .visual_line => {
+                    switch (textobject) {
+                        .paren, .bracket, .brace => self.mode = .visual,
+                        else => {}
+                    }
+                },
+                else => {}
+            }
+            const ordered = self.view.cursor.getOrdered();
+            const range = document.rope.getTextObject(textobject, false, ordered[0]);
+            result.selection.tail = range[0];
+            result.selection.head = @max(range[1] -| 1, range[0]);
+            result.cursor_position = @max(range[1] -| 1, range[0]);
+            std.debug.print("thign: {}\n", .{result.selection});
+
+            const line_range = document.rope.getLineRange(result.cursor_position).?; // right now this can't return null
+            result.max_column = result.cursor_position - line_range[0];
+
+
+        },
+        .text_object_outer => {},
     }
     return result;
 }

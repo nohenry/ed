@@ -10,6 +10,114 @@ comptime {
     _ = Rope;
 }
 
+pub const TextObject = enum {
+    word,
+    WORD,
+    paren,
+    bracket,
+    brace,
+    double_quote,
+    single_quote,
+    backtick,
+
+    pub inline fn fromChar(char: u32) ?TextObject {
+        return switch (char) {
+            'w' => .word,
+            'W' => .WORD,
+            '(' => .paren,
+            ')' => .paren,
+            '[' => .bracket,
+            ']' => .bracket,
+            '{' => .brace,
+            '}' => .brace,
+            '"' => .double_quote,
+            '\'' => .single_quote,
+            '`' => .backtick,
+            else => null,
+        };
+    }
+
+    pub inline fn getOpen(comptime self: TextObject) u8 {
+        return switch (self) {
+            .paren => '(',
+            .bracket => '[',
+            .brace => '{',
+            else => unreachable,
+        };
+    }
+
+    pub inline fn getClose(comptime self: TextObject) u8 {
+        return switch (self) {
+            .paren => ')',
+            .bracket => ']',
+            .brace => '}',
+            else => unreachable,
+        };
+    }
+
+    pub inline fn computeLevel(comptime self: TextObject, char: u8, level: *i32) void {
+        switch (self) {
+            .word => {},
+            .WORD => {},
+            .paren => switch (char) {
+                '(' => level.* += 1,
+                ')' => level.* -= 1,
+                else => {},
+            },
+            .bracket => switch (char) {
+                '[' => level.* += 1,
+                ']' => level.* -= 1,
+                else => {},
+            },
+            .brace => switch (char) {
+                '{' => level.* += 1,
+                '}' => level.* -= 1,
+                else => {},
+            },
+            .double_quote => {},
+            .single_quote => {},
+            .backtick => {},
+        }
+    }
+
+    pub inline fn isValid(comptime self: TextObject, char: u8) bool {
+        return switch (self) {
+            .word => switch (char) {
+                'a'...'z', 'A'...'Z', '0'...'9', '_', '-' => true,
+                else => false,
+            },
+            .WORD => switch (char) {
+                ' ', '\n', '\r', '\t' => false,
+                else => true,
+            },
+            .paren => switch (char) {
+                '(', ')' => false,
+                else => true,
+            },
+            .bracket => switch (char) {
+                '[', ']' => false,
+                else => true,
+            },
+            .brace => switch (char) {
+                '{', '}' => false,
+                else => true,
+            },
+            .double_quote => switch (char) {
+                '"' => false,
+                else => true,
+            },
+            .single_quote => switch (char) {
+                '\'' => false,
+                else => true,
+            },
+            .backtick => switch (char) {
+                '`' => false,
+                else => true,
+            },
+        };
+    }
+};
+
 pub const Key = enum {
     char,
     escape,

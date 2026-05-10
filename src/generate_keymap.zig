@@ -50,6 +50,9 @@ const Movement = enum {
     find_till_prev,
     find_again_next,
     find_again_prev,
+
+    text_object_inner,
+    text_object_outer,
 };
 
 pub fn movementTupleToCombo(movement_tuple: anytype) KeyCombo {
@@ -65,6 +68,13 @@ pub fn movementTupleToCombo(movement_tuple: anytype) KeyCombo {
     }
 
     return key;
+}
+
+pub fn movementExcludeFromTopLevel(comptime movement_: Movement) bool {
+    return switch (movement_) {
+        .text_object_inner, .text_object_outer => true,
+        else => false,
+    };
 }
 
 pub fn movementKeysCombo(comptime movement_: Movement) KeyCombo {
@@ -86,6 +96,9 @@ pub fn movementKeysCombo(comptime movement_: Movement) KeyCombo {
         .find_till_prev => .{'T'},
         .find_again_next => .{';'},
         .find_again_prev => .{','},
+
+        .text_object_inner => .{'i'},
+        .text_object_outer => .{'a'},
     };
     return movementTupleToCombo(value);
 }
@@ -96,6 +109,8 @@ pub fn movementKeysNeedsChar(comptime movement_: Movement) bool {
         .find_prev,
         .find_till_next,
         .find_till_prev,
+        .text_object_inner,
+        .text_object_outer,
         => true,
         else => false,
     };
@@ -199,7 +214,8 @@ fn generate(writer: *std.Io.Writer, dispatch_function_name: []const u8, comptime
                             next_state += 1;
 
                             inline for (std.meta.fields(Movement)) |field| {
-                                const movement_ = movementKeysCombo(@enumFromInt(field.value));
+                                const movement_ = comptime movementKeysCombo(@enumFromInt(field.value));
+                                if (i == 0 and comptime movementExcludeFromTopLevel(@enumFromInt(field.value))) continue;
                                 const needs_char = movementKeysNeedsChar(@enumFromInt(field.value));
 
                                 const result = switch (parent_node.next) {
@@ -334,7 +350,7 @@ fn generate_zig_code(writer: *std.Io.Writer, node: *KeyNode1, i: usize) !void {
 
     switch (node.next) {
         .character => |value| if (value != null and value.?.generated) return,
-        else => {}
+        else => {},
     }
 
     for (0..i) |_| _ = try writer.write("    ");

@@ -2444,6 +2444,166 @@ pub fn getPreviousWord(self: *Self, position: usize) usize {
     return position - current_offset;
 }
 
+pub fn getTextObject(self: *Self, textobject: ed.TextObject, outer: bool, position: usize) struct { usize, usize } {
+    _ = outer;
+    var current_offset = position;
+    const start_node, const start_node_offset = self.indexNode(current_offset).?;
+    var has_been_valid = false;
+    var has_been_invalid = false;
+
+    switch (textobject) {
+        inline .word, .WORD, .double_quote, .single_quote, .backtick => |obj| {
+            var current_node, var current_node_offset = .{ start_node, start_node_offset };
+
+            while (current_offset > 0) : (current_offset -= 1) {
+                const char = current_node.string.items[current_node_offset];
+                if (ed.TextObject.isValid(obj, char)) {
+                    if (has_been_invalid) {
+                        current_offset += 1;
+                        break;
+                    }
+                    has_been_valid = true;
+                } else {
+                    if (has_been_valid) {
+                        current_offset += 1;
+                        break;
+                    }
+                    has_been_invalid = true;
+                }
+                current_node, current_node_offset = current_node.previousNodeChar(current_node_offset) orelse break;
+            }
+            const start = current_offset;
+
+            current_offset = position;
+            current_node, current_node_offset = .{ start_node, start_node_offset };
+            while (current_offset < self.len) : (current_offset += 1) {
+                if (ed.TextObject.isValid(obj, current_node.string.items[current_node_offset])) {
+                    if (!has_been_valid) {
+                        break;
+                    }
+                } else {
+                    if (has_been_valid) {
+                        break;
+                    }
+                }
+                current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse break;
+            }
+            const end = current_offset;
+
+            return .{ start, end };
+        },
+        inline .paren, .bracket, .brace => |obj| {
+            var current_node, var current_node_offset = .{ start_node, start_node_offset };
+            var level: i32 = 0;
+
+            var char = current_node.string.items[current_node_offset];
+            if (char == obj.getClose()) blk: {
+                // Do this, so we don't increment level in .scan_open_backward state
+                current_node, current_node_offset = current_node.previousNodeChar(current_node_offset) orelse break :blk;
+                current_offset -= 1;
+            }
+
+            var start = position;
+            var end = position;
+            // The idea here is, we first scan backwards to find the first unmatched bracket.
+            //   if there is no unmatched bracket, then we start scanning forward (from the starting position)
+            //   to find first open bracket. Next we scan forward to find the matching closing bracket
+            sw: switch (@as(enum { scan_open_backward, scan_open_forward, scan_close_forward }, .scan_open_backward)) {
+                .scan_open_backward => {
+                    while (current_offset > 0) : (current_offset -= 1) {
+                        char = current_node.string.items[current_node_offset];
+                        switch (char) {
+                            obj.getOpen() => {
+                                if (level == 0) {
+                                    current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse unreachable;
+                                    if (current_node.string.items[current_node_offset] != obj.getClose()) {
+                                        // this is sus, but works
+                                        current_offset += 1;
+                                    }
+                                    break;
+                                }
+                                level -= 1;
+                            },
+                            obj.getClose() => {
+                                level += 1;
+                            },
+                            else => {},
+                        }
+                        current_node, current_node_offset = current_node.previousNodeChar(current_node_offset) orelse unreachable;
+                    } else {
+                        // If we didn't break, we never reached an unmatched bracket, so start scanning forward.
+                        current_node, current_node_offset = .{ start_node, start_node_offset };
+                        current_offset = position;
+                        continue :sw .scan_open_forward;
+                    }
+
+                    if (current_node.string.items[current_node_offset] == '\n') {
+                        start = current_offset + 1;
+                    } else {
+                        start = current_offset;
+                    }
+
+                    continue :sw .scan_close_forward;
+                },
+                .scan_open_forward => {
+                    level = 0;
+                    while (current_offset < self.len) : (current_offset += 1) {
+                        char = current_node.string.items[current_node_offset];
+                        switch (char) {
+                            obj.getOpen() => {
+                                if (level == 0) {
+                                    current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse return .{ position, position };
+                                    if (current_node.string.items[current_node_offset] != obj.getClose()) {
+                                        current_offset += 1;
+                                    }
+                                    break;
+                                }
+
+                                level += 1;
+                            },
+                            obj.getClose() => {
+                                level -= 1;
+                            },
+                            else => {},
+                        }
+                        current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse return .{ position, position };
+                    } else {
+                        // If we didn't break, we never reached a valid open bracket.
+                        return .{ position, position };
+                    }
+                    start = current_offset;
+
+                    continue :sw .scan_close_forward;
+                },
+                .scan_close_forward => {
+                    level = 0;
+                    while (current_offset < self.len) : (current_offset += 1) {
+                        char = current_node.string.items[current_node_offset];
+                        switch (char) {
+                            obj.getOpen() => {
+                                level += 1;
+                            },
+                            obj.getClose() => {
+                                if (level == 0) {
+                                    break;
+                                }
+                                level -= 1;
+                            },
+                            else => {},
+                        }
+                        current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse break;
+                    } else {
+                        return .{ position, position };
+                    }
+                    end = current_offset;
+                },
+            }
+
+            return .{ start, end };
+        },
+    }
+}
+
 pub const Matcher = struct {
     iterator: Iterator = .{},
     saved_iterator: Iterator = .{},

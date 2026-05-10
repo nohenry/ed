@@ -43,7 +43,7 @@ pub const normal_keymap_definition = .{
 pub const visual_keymap_definition = .{
     .{ 'd', "commandVisualDelete" },
     .{ 'c', "commandVisualChange" },
-    .{ 'x', "commandDeleteUnder" },
+    .{ 'x', "commandVisualDelete" },
 
     .{ 'y', "commandVisualYank" },
 
@@ -57,6 +57,9 @@ pub const visual_keymap_definition = .{
 
     .{ '>', "commandIndentIn" },
     .{ '<', "commandIndentOut" },
+
+    .{ 'i', character, "commandVisualTextObjectInner" },
+    .{ 'a', character, "commandVisualTextObjectOuter" },
 
     .{ movement, "commandMove" },
 };
