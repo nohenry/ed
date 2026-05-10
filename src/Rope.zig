@@ -1720,7 +1720,6 @@ pub fn dumpGraphImpl(node: *Node, id: usize, writer: *std.Io.Writer) !usize {
 
 pub const Iterator = struct {
     node_iter: NodeIterator = .{},
-    current_node: ?*Node = null,
     index: usize = 0,
 
     pub inline fn save(self: Iterator) Iterator {
@@ -1732,11 +1731,12 @@ pub const Iterator = struct {
     }
 
     pub fn nextByte(self: *Iterator) ?u8 {
-        while (self.current_node != null and self.index >= self.current_node.?.string.items.len) {
-            self.current_node = self.node_iter.next();
+        var current_node = self.node_iter.current();
+        while (current_node != null and self.index >= current_node.?.string.items.len) {
+            current_node = self.node_iter.next();
             self.index = 0;
         }
-        const current = self.current_node orelse return null;
+        const current = current_node orelse return null;
 
         defer self.index += 1;
 
@@ -1744,23 +1744,24 @@ pub const Iterator = struct {
     }
 
     pub fn prevByte(self: *Iterator) ?u8 {
-        while (self.current_node != null and self.index == 0) {
-            self.current_node = self.node_iter.prev();
-            if (self.current_node) |cn| self.index = cn.string.items.len - 1;
+        var current_node = self.node_iter.current();
+        while (current_node != null and self.index == 0) {
+            current_node = self.node_iter.prev();
+            if (current_node) |cn| self.index = cn.string.items.len - 1;
         }
-        const current = self.current_node orelse return null;
+        const current = current_node orelse return null;
 
-        defer self.index -= 1;
-
+        self.index -= 1;
         return current.string.items[self.index];
     }
 
     pub fn next(self: *Iterator) ?u32 {
-        while (self.current_node != null and self.index >= self.current_node.?.string.items.len) {
-            self.current_node = self.node_iter.next();
+        var current_node = self.node_iter.current();
+        while (current_node != null and self.index >= current_node.?.string.items.len) {
+            current_node = self.node_iter.next();
             self.index = 0;
         }
-        const current = self.current_node orelse return null;
+        const current = current_node orelse return null;
 
         const length = std.unicode.utf8ByteSequenceLength(current.string.items[self.index]) catch @panic("invlaid utf8");
         const codepoint = std.unicode.utf8Decode(current.string.items[self.index .. self.index + length]) catch @panic("invalid utf8");
@@ -1770,13 +1771,13 @@ pub const Iterator = struct {
     }
 
     pub fn prev(self: *Iterator) ?u32 {
-        const current = self.current_node orelse return null;
+        const current = self.node_iter.current() orelse return null;
         const new_node, const new_index = current.previousNodeChar(self.index) orelse .{ null, 0 };
 
         const length = std.unicode.utf8ByteSequenceLength(current.string.items[self.index]) catch @panic("invlaid utf8");
         const codepoint = std.unicode.utf8Decode(current.string.items[self.index .. self.index + length]) catch @panic("invalid utf8");
         defer {
-            self.current_node = new_node;
+            self.node_iter.current_ = new_node;
             self.index = new_index;
         }
 
@@ -1789,24 +1790,18 @@ pub inline fn iter(self: *Self) Iterator {
 }
 
 pub fn iterNode(self: *Self, node: ?*Node) Iterator {
-    var node_iter = self.nodeIterNode(node);
-    const start_node = node_iter.next();
+    const node_iter = self.nodeIterNode(node);
     return .{
         .node_iter = node_iter,
-        .current_node = start_node,
     };
 }
 
 pub fn iterStartingFrom(self: *Self, position: Position) Iterator {
-    var node_iter = self.nodeIter();
     const start_node, const start_offset = self.indexNode(position) orelse return .{
-        .node_iter = .{ .root = null, .current = null },
-        .current_node = null,
+        .node_iter = .{ .root = null, .current_ = null },
     };
-    node_iter.current = start_node.nextLeaf();
     return .{
-        .node_iter = node_iter,
-        .current_node = start_node,
+        .node_iter = self.nodeIterLeafNode(start_node),
         .index = start_offset,
     };
 }
@@ -1844,7 +1839,7 @@ pub fn iterUtf16(self: *Self, output_buffer: *[2]u16) Utf16Iterator {
 
 pub fn iterUtf16StartingFrom(self: *Self, output_buffer: *[2]u16, position: Position) Utf16Iterator {
     const start_node, const start_offset = self.indexNode(position) orelse return .{
-        .node_iter = .{ .root = null, .current = null },
+        .node_iter = .{ .root = null, .current_ = null },
         .current_node = null,
         .output_buffer = output_buffer,
     };
@@ -1859,22 +1854,35 @@ pub fn iterUtf16StartingFrom(self: *Self, output_buffer: *[2]u16, position: Posi
 
 pub const NodeIterator = struct {
     root: ?*Node = null,
-    current: ?*Node = null,
+    start_node: ?*Node = null,
+    current_: ?*Node = null,
+
+    pub fn current(self: *NodeIterator) ?*Node {
+        if (self.current_ == null) {
+            self.current_ = self.start_node;
+            self.start_node = null;
+        }
+        return self.current_;
+    }
 
     pub fn next(self: *NodeIterator) ?*Node {
-        const result = self.current;
-        if (self.current) |c| {
-            self.current = c.nextLeaf();
+        if (self.current_) |c| {
+            self.current_ = c.nextLeaf();
+        } else {
+            self.current_ = self.start_node;
+            self.start_node = null;
         }
-        return result;
+        return self.current_;
     }
 
     pub fn prev(self: *NodeIterator) ?*Node {
-        const result = self.current;
-        if (self.current) |c| {
-            self.current = c.previousLeaf();
+        if (self.current_) |c| {
+            self.current_ = c.previousLeaf();
+        } else {
+            self.current_ = self.start_node;
+            self.start_node = null;
         }
-        return result;
+        return self.current_;
     }
 };
 
@@ -1886,7 +1894,7 @@ pub inline fn nodeIterLeafNode(self: *Self, leaf: ?*Node) NodeIterator {
     std.debug.assert(leaf == null or leaf.?.isLeaf());
     return .{
         .root = self.root,
-        .current = leaf,
+        .start_node = leaf,
     };
 }
 
@@ -1897,7 +1905,7 @@ pub fn nodeIterNode(self: *Self, root_node: ?*Node) NodeIterator {
         if (c.isLeaf()) break;
         current = c.left;
     }
-    return .{ .root = self.root, .current = current };
+    return .{ .root = self.root, .start_node = current };
 }
 
 pub const RangeIterator = struct {
@@ -2448,6 +2456,12 @@ pub const Matcher = struct {
 
     pub const empty = Matcher{};
 
+    pub fn setCurrent(self: *Matcher, rope: *Self, position: usize) void {
+        self.iterator = rope.iterStartingFrom(position);
+        self.start = position;
+        self.end = position;
+    }
+
     pub fn wrapNext(self: *Matcher, rope: *Self) void {
         self.iterator = rope.iter();
         self.start = 0;
@@ -2471,14 +2485,15 @@ pub const Matcher = struct {
         self.start = self.end;
 
         var matched, var match_length = self.pattern.matchesWithIterator(Iterator.nextByte, &self.iterator);
-        while (!matched) {
-            const t = self.iterator.next();
-            if (t == null) return null;
-            self.start += std.unicode.utf8CodepointSequenceLength(@truncate(t.?)) catch @panic("Invalid utf8");
-            matched, match_length = self.pattern.matchesWithIterator(Iterator.nextByte, &self.iterator);
+        {
+            defer self.end = self.start + match_length;
+            while (!matched) {
+                const t = self.iterator.next();
+                if (t == null) return null;
+                self.start += std.unicode.utf8CodepointSequenceLength(@truncate(t.?)) catch @panic("Invalid utf8");
+                matched, match_length = self.pattern.matchesWithIterator(Iterator.nextByte, &self.iterator);
+            }
         }
-
-        self.end = self.start + match_length;
 
         return .{ .head = self.end -| 1, .tail = self.start };
     }
@@ -2491,7 +2506,10 @@ pub const Matcher = struct {
         }
         self.dir = .prev;
 
-        if (self.start == 0) return null;
+        if (self.start == 0) {
+            self.end = 0;
+            return null;
+        }
 
         self.start -= 1;
         self.end -= 1;
@@ -2501,17 +2519,18 @@ pub const Matcher = struct {
         var matched, var match_length = self.pattern.matchesWithIterator(Iterator.nextByte, &self.iterator);
         self.iterator.restore(saved);
 
-        while (!matched) {
-            const t = self.iterator.prev();
-            if (t == null) return null;
-            self.start -= std.unicode.utf8CodepointSequenceLength(@truncate(t.?)) catch @panic("Invalid utf8");
+        {
+            defer self.end = self.start + match_length;
+            while (!matched) {
+                const t = self.iterator.prev();
+                if (t == null) return null;
+                self.start -= std.unicode.utf8CodepointSequenceLength(@truncate(t.?)) catch @panic("Invalid utf8");
 
-            saved = self.iterator.save();
-            matched, match_length = self.pattern.matchesWithIterator(Iterator.nextByte, &self.iterator);
-            self.iterator.restore(saved);
+                saved = self.iterator.save();
+                matched, match_length = self.pattern.matchesWithIterator(Iterator.nextByte, &self.iterator);
+                self.iterator.restore(saved);
+            }
         }
-
-        self.end = self.start + match_length;
 
         return .{ .head = self.end -| 1, .tail = self.start };
     }

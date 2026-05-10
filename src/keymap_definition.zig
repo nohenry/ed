@@ -34,6 +34,8 @@ pub const normal_keymap_definition = .{
     .{ '>', "commandIndentIn" },
     .{ '<', "commandIndentOut" },
 
+    .{ 'n', "commandVisualSearchNext" },
+    .{ 'N', "commandVisualSearchPrev" },
 
     .{ movement, "commandMove" },
 };

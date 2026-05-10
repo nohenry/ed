@@ -526,8 +526,11 @@ pub fn commandDeleteMovement(self: *Self, dispatch: *DispatchState) void {
 
 pub fn commandDeleteLine(self: *Self, dispatch: *DispatchState) void {
     _ = dispatch;
-    _ = self;
-    std.debug.print("Delte line\n", .{});
+    const document = self.documents.getPtr(self.current_document) orelse return;
+    const line_range = document.rope.getLineRange(self.view.cursor.head) orelse {
+        return;
+    };
+    _ = document.rope.deleteRange(line_range[0], line_range[1]);
 }
 
 pub fn commandDeleteUnder(self: *Self, dispatch: *DispatchState) void {
@@ -754,11 +757,9 @@ pub fn commandIndentOut(self: *Self, dispatch: *DispatchState) void {
     while (range_iterator.next()) |slice| {
         start = 0;
 
-        std.debug.print("Range: '{s}'\n", .{slice});
         for (slice, 0..) |item, i| {
             switch (item) {
                 '\n' => {
-                    std.debug.print("start skip {} {}\n", .{ start, i + 1 });
                     sb.appendSlice(document.rope.allocator, slice[start .. i + 1]) catch @panic("OOM");
                     indent = 0;
                     skip_indent = true;
@@ -1010,7 +1011,13 @@ pub fn commandVisualSearch(self: *Self, dispatch: *DispatchState) void {
 
     const document = self.documents.getPtr(self.current_document) orelse return;
 
-    if (self.matcher) |*m| {
+    if (self.matcher) |*m| blk: {
+        const range = self.view.cursor.getOrdered();
+        const pattern_text = document.rope.toOwnedSlice(range[0], range[1] + 1, self.scratch.allocator());
+
+        if (!m.pattern.matches(pattern_text)[0]) break :blk;
+
+        m.setCurrent(&document.rope, range[1]);
         var match_opt = m.next();
         if (match_opt) |match| {
             self.adjustViewToCursorPosition(match.getOrdered()[0]);
@@ -1024,7 +1031,10 @@ pub fn commandVisualSearch(self: *Self, dispatch: *DispatchState) void {
                 self.view.cursor = match;
             }
         }
-    } else {
+
+        return;
+    }
+    {
         const range = self.view.cursor.getOrdered();
         const pattern_text = document.rope.toOwnedSlice(range[0], range[1] + 1, self.allocator);
 
@@ -1045,7 +1055,13 @@ pub fn commandVisualSearchReverse(self: *Self, dispatch: *DispatchState) void {
 
     const document = self.documents.getPtr(self.current_document) orelse return;
 
-    if (self.matcher) |*m| {
+    if (self.matcher) |*m| blk: {
+        const range = self.view.cursor.getOrdered();
+        const pattern_text = document.rope.toOwnedSlice(range[0], range[1] + 1, self.scratch.allocator());
+
+        if (!m.pattern.matches(pattern_text)[0]) break :blk;
+
+        m.setCurrent(&document.rope, range[0]);
         var match_opt = m.prev();
         if (match_opt) |match| {
             self.adjustViewToCursorPosition(match.getOrdered()[0]);
@@ -1059,7 +1075,11 @@ pub fn commandVisualSearchReverse(self: *Self, dispatch: *DispatchState) void {
                 self.view.cursor = match;
             }
         }
-    } else {
+
+        return;
+    }
+
+    {
         const range = self.view.cursor.getOrdered();
         const pattern_text = document.rope.toOwnedSlice(range[0], range[1] + 1, self.allocator);
 
@@ -1085,6 +1105,7 @@ pub fn commandVisualSearchNext(self: *Self, dispatch: *DispatchState) void {
         if (match_opt) |match| {
             self.adjustViewToCursorPosition(match.getOrdered()[0]);
             self.view.cursor = match;
+            self.mode = .visual;
         } else {
             m.wrapNext(&document.rope);
 
@@ -1092,6 +1113,7 @@ pub fn commandVisualSearchNext(self: *Self, dispatch: *DispatchState) void {
             if (match_opt) |match| {
                 self.adjustViewToCursorPosition(match.getOrdered()[0]);
                 self.view.cursor = match;
+                self.mode = .visual;
             }
         }
     }
@@ -1107,6 +1129,7 @@ pub fn commandVisualSearchPrev(self: *Self, dispatch: *DispatchState) void {
         if (match_opt) |match| {
             self.adjustViewToCursorPosition(match.getOrdered()[0]);
             self.view.cursor = match;
+            self.mode = .visual;
         } else {
             m.wrapPrev(&document.rope);
 
@@ -1114,6 +1137,7 @@ pub fn commandVisualSearchPrev(self: *Self, dispatch: *DispatchState) void {
             if (match_opt) |match| {
                 self.adjustViewToCursorPosition(match.getOrdered()[0]);
                 self.view.cursor = match;
+                self.mode = .visual;
             }
         }
     }
@@ -1453,6 +1477,10 @@ pub fn calculateCursorViewCoords(self: *Self) ed.Rope.Coordinate {
     const result = current_document.rope.lineColumnFromRelativePosition(self.view.start_position, self.view.cursor.head).?;
     // const result = current_document.rope.add(self.view.cursor_position, 0, ed.Rope.Coordinate);
     return result;
+}
+
+pub fn finish_frame(self: *Self) void {
+    _ = self.scratch.reset(.retain_capacity);
 }
 
 pub fn render(self: *Self, area: ed.Rect, renderer: *ed.Renderer) void {

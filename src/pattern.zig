@@ -84,7 +84,7 @@ pub const Pattern = union(enum) {
         }
     }
 
-    pub fn matches(self: *Pattern, string: []const u8) struct { bool, usize } {
+    pub fn matches(self: *const Pattern, string: []const u8) struct { bool, usize } {
         var len: usize = 0;
         switch (self.*) {
             .literal => |a| return if (std.mem.startsWith(u8, string, a)) .{ true, a.len } else .{ false, 0 },

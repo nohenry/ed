@@ -184,6 +184,9 @@ pub const Application = struct {
 
         self.renderer.end_glyph_placement();
         self.renderer.draw();
+        if (self.editor) |editr| {
+            editr.finish_frame();
+        }
     }
 
     pub fn run(self: *Application) void {
