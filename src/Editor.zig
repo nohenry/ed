@@ -186,6 +186,41 @@ pub fn handleVisualModeKeydown(self: *Self, event: ed.Event) void {
     }
 }
 
+pub fn collapseCursor(self: *Self, rope: *ed.Rope) void {
+    var new_head: usize = 0;
+    var new_tail: usize = 0;
+    switch (self.mode) {
+        .visual_line => {
+            if (self.view.cursor.tail < self.view.cursor.head) {
+                const line_range = rope.getLineRange(self.view.cursor.tail) orelse return;
+                new_tail = @min(line_range[0] + self.view.max_column, line_range[1] -| 1);
+                new_head = new_tail;
+            } else {
+                const line_range = rope.getLineRange(self.view.cursor.head) orelse return;
+                new_head = @min(line_range[0] + self.view.max_column, line_range[1] -| 1);
+                new_tail = new_head;
+            }
+        },
+        .visual => {
+            if (self.view.cursor.tail < self.view.cursor.head) {
+                const line_range = rope.getLineRange(self.view.cursor.tail) orelse return;
+                new_head = self.view.cursor.tail;
+                new_tail = self.view.cursor.tail;
+                self.view.max_column = new_tail - line_range[0];
+            } else {
+                const line_range = rope.getLineRange(self.view.cursor.head) orelse return;
+                new_head = self.view.cursor.head;
+                new_tail = self.view.cursor.head;
+                self.view.max_column = new_head - line_range[0];
+            }
+        },
+        else => unreachable,
+    }
+    self.adjustViewToCursorPosition(new_head);
+    self.view.cursor.head = new_head;
+    self.view.cursor.tail = new_tail;
+}
+
 pub fn setCursor(self: *Self, position: usize) void {
     switch (self.mode) {
         .normal, .insert => {
@@ -518,10 +553,24 @@ pub fn commandEnterVisualLineMode(self: *Self, dispatch: *DispatchState) void {
 pub fn commandDeleteMovement(self: *Self, dispatch: *DispatchState) void {
     const movement_result = self.calculateKeyMovement(dispatch.movement.?, dispatch.chars(), .delete) orelse return;
     const document = self.documents.getPtr(self.current_document) orelse return;
-    _ = document.rope.deleteRange(movement_result.selection.tail, movement_result.selection.head);
+
+    if (movement_result.selection.tail < self.view.start_position) {
+        const line_column = document.rope.lineColumnFromRelativePosition(movement_result.selection.tail, self.view.start_position).?;
+        const lines = @min(line_column.line, self.view.lines / 2);
+
+        const new_start_position = document.rope.sub(
+            movement_result.selection.tail,
+            ed.Rope.Coordinate{ .line = lines, .column = 0 },
+            ed.Rope.Position,
+        );
+        self.view.start_position = new_start_position;
+    }
+    const ordered = movement_result.selection.getOrdered();
+    _ = document.rope.deleteRange(ordered[0], ordered[1] + 1);
 
     if (movement_result.linewise) {
         self.setCursor(movement_result.cursor_position);
+        self.view.max_column = movement_result.max_column;
     }
 }
 
@@ -545,10 +594,24 @@ pub fn commandDeleteUnder(self: *Self, dispatch: *DispatchState) void {
 pub fn commandChangeMovement(self: *Self, dispatch: *DispatchState) void {
     const movement_result = self.calculateKeyMovement(dispatch.movement.?, dispatch.chars(), .delete) orelse return;
     const document = self.documents.getPtr(self.current_document) orelse return;
-    _ = document.rope.deleteRange(movement_result.selection.tail, movement_result.selection.head);
+
+    if (movement_result.selection.tail < self.view.start_position) {
+        const line_column = document.rope.lineColumnFromRelativePosition(movement_result.selection.tail, self.view.start_position).?;
+        const lines = @min(line_column.line, self.view.lines / 2);
+
+        const new_start_position = document.rope.sub(
+            self.view.cursor.tail,
+            ed.Rope.Coordinate{ .line = lines, .column = 0 },
+            ed.Rope.Position,
+        );
+        self.view.start_position = new_start_position;
+    }
+    const ordered = movement_result.selection.getOrdered();
+    _ = document.rope.deleteRange(ordered[0], ordered[1] + 1);
 
     if (movement_result.linewise) {
         self.setCursor(movement_result.cursor_position);
+        self.view.max_column = movement_result.max_column;
     }
     self.mode = .insert;
 }
@@ -955,29 +1018,21 @@ pub fn commandVisualDelete(self: *Self, dispatch: *DispatchState) void {
 
     const document = self.documents.getPtr(self.current_document) orelse return;
     const ordered = self.view.cursor.getOrdered();
-    _ = document.rope.deleteRange(ordered[0], ordered[1] + 1);
+    if (self.view.cursor.tail < self.view.cursor.head) {
+        if (self.view.cursor.tail < self.view.start_position) {
+            const line_column = document.rope.lineColumnFromRelativePosition(self.view.cursor.tail, self.view.start_position).?;
+            const lines = @min(line_column.line, self.view.lines / 2);
 
-    if (self.mode == .visual_line) {
-        if (self.view.cursor.tail < self.view.cursor.head) {
-            const line_range = document.rope.getLineRange(self.view.cursor.tail) orelse return;
-            self.view.cursor.tail = @min(line_range[0] + self.view.max_column, line_range[1] -| 1);
-            self.view.cursor.head = self.view.cursor.tail;
-        } else {
-            const line_range = document.rope.getLineRange(self.view.cursor.head) orelse return;
-            self.view.cursor.head = @min(line_range[0] + self.view.max_column, line_range[1] -| 1);
-            self.view.cursor.tail = self.view.cursor.head;
-        }
-    } else {
-        if (self.view.cursor.tail < self.view.cursor.head) {
-            const line_range = document.rope.getLineRange(self.view.cursor.tail) orelse return;
-            self.view.cursor.head = self.view.cursor.tail;
-            self.view.max_column = self.view.cursor.tail - line_range[0];
-        } else {
-            const line_range = document.rope.getLineRange(self.view.cursor.head) orelse return;
-            self.view.cursor.tail = self.view.cursor.head;
-            self.view.max_column = self.view.cursor.head - line_range[0];
+            const new_start_position = document.rope.sub(
+                self.view.cursor.tail,
+                ed.Rope.Coordinate{ .line = lines, .column = 0 },
+                ed.Rope.Position,
+            );
+            self.view.start_position = new_start_position;
         }
     }
+    _ = document.rope.deleteRange(ordered[0], ordered[1] + 1);
+    self.collapseCursor(&document.rope);
     self.mode = .normal;
 }
 
@@ -986,26 +1041,21 @@ pub fn commandVisualChange(self: *Self, dispatch: *DispatchState) void {
 
     const document = self.documents.getPtr(self.current_document) orelse return;
     const ordered = self.view.cursor.getOrdered();
-    _ = document.rope.deleteRange(ordered[0], ordered[1] + 1);
+    if (self.view.cursor.tail < self.view.cursor.head) {
+        if (self.view.cursor.tail < self.view.start_position) {
+            const line_column = document.rope.lineColumnFromRelativePosition(self.view.cursor.tail, self.view.start_position).?;
+            const lines = @min(line_column.line, self.view.lines / 2);
 
-    if (self.mode == .visual_line) {
-        if (self.view.cursor.tail < self.view.cursor.head) {
-            const line_range = document.rope.getLineRange(self.view.cursor.tail) orelse return;
-            self.view.cursor.tail = @min(line_range[0] + self.view.max_column, line_range[1] -| 1);
-            self.view.cursor.head = self.view.cursor.tail;
-        } else {
-            const line_range = document.rope.getLineRange(self.view.cursor.head) orelse return;
-            self.view.cursor.head = @min(line_range[0] + self.view.max_column, line_range[1] -| 1);
-            self.view.cursor.tail = self.view.cursor.head;
-        }
-    } else {
-        if (self.view.cursor.tail < self.view.cursor.head) {
-            self.view.cursor.head = self.view.cursor.tail;
-        } else {
-            self.view.cursor.tail = self.view.cursor.head;
+            const new_start_position = document.rope.sub(
+                self.view.cursor.tail,
+                ed.Rope.Coordinate{ .line = lines, .column = 0 },
+                ed.Rope.Position,
+            );
+            self.view.start_position = new_start_position;
         }
     }
-
+    _ = document.rope.deleteRange(ordered[0], ordered[1] + 1);
+    self.collapseCursor(&document.rope);
     self.mode = .insert;
 }
 
@@ -1301,8 +1351,8 @@ pub fn calculateKeyMovement(self: *Self, movement: Movement, chars: []const u32,
                 }
             }
             result.selection.tail = self.view.cursor.tail;
-            result.selection.head = self.view.cursor.head + 1;
-            result.cursor_position = self.view.cursor.head + 1;
+            result.selection.head = self.view.cursor.head;
+            result.cursor_position = self.view.cursor.head;
             if (do_max) result.max_column = self.view.max_column + 1;
         },
         .left => {
@@ -1516,22 +1566,25 @@ pub fn calculateKeyMovement(self: *Self, movement: Movement, chars: []const u32,
                 .visual_line => {
                     switch (textobject) {
                         .paren, .bracket, .brace => self.mode = .visual,
-                        else => {}
+                        else => {},
                     }
                 },
-                else => {}
+                else => {},
             }
             const ordered = self.view.cursor.getOrdered();
             const range = document.rope.getTextObject(textobject, false, ordered[0]);
             result.selection.tail = range[0];
             result.selection.head = @max(range[1] -| 1, range[0]);
-            result.cursor_position = @max(range[1] -| 1, range[0]);
-            std.debug.print("thign: {}\n", .{result.selection});
+            switch (purpose) {
+                .delete => {
+                    result.cursor_position = range[0];
+                    result.linewise = true;
+                },
+                .move => {},
+            }
 
             const line_range = document.rope.getLineRange(result.cursor_position).?; // right now this can't return null
             result.max_column = result.cursor_position - line_range[0];
-
-
         },
         .text_object_outer => {},
     }

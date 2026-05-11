@@ -154,6 +154,7 @@ pub const Application = struct {
         self.editor = self.allocator.create(ed.Editor) catch @panic("OOM");
         self.editor.?.* = .init(self, &win32_applicaiton, io, self.allocator);
         self.editor.?.openDocument("build.zig");
+        // self.editor.?.openDocument("src/Rope.zig");
     }
 
     pub fn resize(self: *Application, width: u32, height: u32) void {
