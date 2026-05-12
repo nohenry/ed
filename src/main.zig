@@ -9,43 +9,12 @@ comptime {
 }
 
 pub fn main(init: std.process.Init) !void {
-    const application = ed.Application.createTestingFromNonTesting(init.io, init.arena.allocator(), "test/test1");
+    var application: ed.Application = .{};
+    application.initPinned(init.io, init.gpa, "MyEditor", false);
     defer application.deinit();
-    var editor = application.getEditor();
-    defer editor.quit();
 
-    try editor.testMotion(&.{.{ .char = 'l' }}, 1, 1);
-    try editor.testMotion(&.{.{ .char = 'h' }}, 0, 0);
-    try editor.testMotion(&.{.{ .char = 'k' }}, 0, 0);
-    try editor.testMotion(&.{.{ .char = 'j' }}, 21, 21);
-    try editor.testMotion(&.{.{ .char = 'l' }}, 22, 22);
-    try editor.testMotion(&.{.{ .char = 'k' }}, 1, 1);
-
-    try editor.testMotion(&.{.{ .char = 'w' }}, 6, 6);
-    try editor.testMotion(&.{.{ .char = 'w' }}, 9, 9);
-    try editor.testMotion(&.{.{ .char = 'e' }}, 13, 13);
-    try editor.testMotion(&.{.{ .char = 'b' }}, 9, 9);
-    try editor.testMotion(&.{.{ .char = 'w' }}, 15, 15);
-    try editor.testMotion(&.{.{ .char = 'w' }}, 21, 21);
-
-    try editor.testMotion(&.{ .{ .char = 'f' }, .{ .char = '@' } }, 27, 27);
-    try editor.testMotion(&.{.{ .char = '_' }}, 21, 21);
-    try editor.testMotion(&.{ .{ .char = 't' }, .{ .char = '@' } }, 26, 26);
-    try editor.testMotion(&.{ .{ .char = 'F' }, .{ .char = '=' } }, 25, 25);
-    try editor.testMotion(&.{.{ .char = '$' }}, 41, 41);
-
-    try editor.testMotion(&.{.{ .char = 'j' }}, 43, 43);
-    try editor.testMotion(&.{.{ .char = 'j' }}, 64, 64);
-    try editor.testMotion(&.{.{ .char = 'j' }}, 99, 99);
-    try editor.testMotion(&.{.{ .char = 'j' }}, 146, 146);
-    try editor.testMotion(&.{.{ .char = '_' }}, 130, 130);
-    try editor.testMotion(&.{.{ .char = '0' }}, 126, 126);
-    // var application: ed.Application = .{};
-    // application.initPinned(init.io, init.gpa, false);
-    // defer application.deinit();
-
-    // application.createEditor(init.io, "test/test_textobject");
-    // application.run();
+    application.createEditor(init.io, "test/test_textobject");
+    application.run();
 }
 
 pub fn main2(init: std.process.Init) !void {

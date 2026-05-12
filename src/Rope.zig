@@ -2445,7 +2445,6 @@ pub fn getPreviousWord(self: *Self, position: usize) usize {
 }
 
 pub fn getTextObject(self: *Self, textobject: ed.TextObject, outer: bool, position: usize) struct { usize, usize } {
-    _ = outer;
     var current_offset = position;
     const start_node, const start_node_offset = self.indexNode(current_offset).?;
     var has_been_valid = false;
@@ -2515,11 +2514,19 @@ pub fn getTextObject(self: *Self, textobject: ed.TextObject, outer: bool, positi
                         switch (char) {
                             obj.getOpen() => {
                                 if (level == 0) {
-                                    current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse unreachable;
-                                    current_offset += 1;
-                                    if (current_node.string.items[current_node_offset] != obj.getClose()) {
-                                        // this is sus, but works
+                                    // increment current_offset if we don't want to include the open char
+                                    // always go to the next node, since we need it for scanning forwards
+                                    current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse return .{ position, position };
+                                    if (outer) {
+                                        start = current_offset;
+                                    } else {
+                                        if (current_node.string.items[current_node_offset] == '\n') {
+                                            start = current_offset + 2; // +1 to consume open, +1 to consume newline
+                                        } else {
+                                            start = current_offset + 1; // +1 to consume open
+                                        }
                                     }
+                                    current_offset += 1;
                                     break;
                                 }
                                 level -= 1;
@@ -2537,12 +2544,6 @@ pub fn getTextObject(self: *Self, textobject: ed.TextObject, outer: bool, positi
                         continue :sw .scan_open_forward;
                     }
 
-                    if (current_node.string.items[current_node_offset] == '\n') {
-                        start = current_offset + 1;
-                    } else {
-                        start = current_offset;
-                    }
-
                     continue :sw .scan_close_forward;
                 },
                 .scan_open_forward => {
@@ -2552,9 +2553,20 @@ pub fn getTextObject(self: *Self, textobject: ed.TextObject, outer: bool, positi
                         switch (char) {
                             obj.getOpen() => {
                                 if (level == 0) {
+                                    // increment current_offset if we don't want to include the open char
+                                    // always go to the next node, since we need it for scanning forwards
                                     current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse return .{ position, position };
+                                    if (outer) {
+                                        start = current_offset;
+                                    } else {
+                                        if (current_node.string.items[current_node_offset] == '\n') {
+                                            start = current_offset + 2; // +1 to consume open, +1 to consume newline
+                                        } else {
+                                            start = current_offset + 1; // +1 to consume open
+                                        }
+                                    }
                                     current_offset += 1;
-                                    if (current_node.string.items[current_node_offset] != obj.getClose()) {}
+
                                     break;
                                 }
 
@@ -2570,12 +2582,6 @@ pub fn getTextObject(self: *Self, textobject: ed.TextObject, outer: bool, positi
                         // If we didn't break, we never reached a valid open bracket.
                         return .{ position, position };
                     }
-                    // start = current_offset;
-                    if (current_node.string.items[current_node_offset] == '\n') {
-                        start = current_offset + 1;
-                    } else {
-                        start = current_offset;
-                    }
 
                     continue :sw .scan_close_forward;
                 },
@@ -2589,7 +2595,7 @@ pub fn getTextObject(self: *Self, textobject: ed.TextObject, outer: bool, positi
                             },
                             obj.getClose() => {
                                 if (level == 0) {
-                                    // current_offset -= 1;
+                                    if (outer) current_offset += 1;
                                     break;
                                 }
                                 level -= 1;

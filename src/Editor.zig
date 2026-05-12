@@ -1253,8 +1253,8 @@ pub fn commandVisualSearchPrev(self: *Self, dispatch: *DispatchState) void {
     }
 }
 
-pub fn commandVisualTextObjectInner(self: *Self, dispatch: *DispatchState) void {
-    const movement_result = self.calculateKeyMovementQuery(.text_object_inner, dispatch.chars(), .select) orelse return;
+fn textObjectCommon(self: *Self, dispatch: *DispatchState, movement: Movement) void {
+    const movement_result = self.calculateKeyMovementQuery(movement, dispatch.chars(), .select) orelse return;
 
     const document = self.documents.getPtr(self.current_document) orelse return;
 
@@ -1311,11 +1311,15 @@ pub fn commandVisualTextObjectInner(self: *Self, dispatch: *DispatchState) void 
         },
         else => unreachable,
     }
+
+}
+
+pub fn commandVisualTextObjectInner(self: *Self, dispatch: *DispatchState) void {
+    textObjectCommon(self, dispatch, .text_object_inner);
 }
 
 pub fn commandVisualTextObjectOuter(self: *Self, dispatch: *DispatchState) void {
-    _ = self;
-    _ = dispatch;
+    textObjectCommon(self, dispatch, .text_object_outer);
 }
 
 pub const Movement = enum {
