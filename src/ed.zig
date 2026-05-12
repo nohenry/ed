@@ -3,11 +3,13 @@ pub const View = @import("View.zig");
 pub const Rope = @import("Rope.zig");
 pub const Editor = @import("Editor.zig");
 pub const Pattern = @import("pattern.zig").Pattern;
+pub const Application = @import("Application.zig");
 
 pub const Renderer = @import("directx/directx.zig").Renderer;
 
 comptime {
     _ = Rope;
+    _ = Editor;
 }
 
 pub const TextObject = enum {
@@ -133,12 +135,14 @@ pub const TimerId = enum(usize) {
     _,
 };
 
+pub const KeyDownEvent = struct {
+    key: Key = .char,
+    char: u32 = 0,
+    modifers: KeyModifiers = .{},
+};
+
 pub const Event = union(enum) {
-    key_down: struct {
-        key: Key,
-        char: u32 = 0,
-        modifers: KeyModifiers,
-    },
+    key_down: KeyDownEvent,
     timer: TimerId,
 };
 

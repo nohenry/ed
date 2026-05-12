@@ -1,5 +1,20 @@
 const Self = @This();
 
+pub const Range = struct {
+    /// inclusive
+    start: usize = 0,
+    /// excluisve
+    end: usize = 0,
+
+    pub inline fn containsPosition(self: @This(), position: usize) bool {
+        return position >= self.start and position < self.end;
+    }
+
+    pub inline fn toSelection(self: @This()) Selection {
+        return .{ .tail = self.start, .head = @max(self.start, self.end -| 1) };
+    }
+};
+
 pub const Selection = struct {
     /// The part of the cursor that is moveable, and is rendered
     head: usize = 0,
@@ -12,6 +27,10 @@ pub const Selection = struct {
 
     pub inline fn getOrdered(self: @This()) struct { usize, usize } {
         return if (self.head >= self.tail) .{ self.tail, self.head } else .{ self.head, self.tail };
+    }
+
+    pub inline fn toRange(self: @This()) Range {
+        return if (self.head >= self.tail) .{ .start = self.tail, .end = self.head + 1 } else .{ .start = self.head, .end = self.tail + 1 };
     }
 };
 

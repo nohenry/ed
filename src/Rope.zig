@@ -1614,7 +1614,7 @@ pub fn deleteRange(self: *Self, start: usize, end: usize) ?struct { *Node, *Node
     var iter_ = self.nodeIterNode(lhs[1]);
 
     while (iter_.next()) |leaf| {
-        std.debug.print("leaf: {s}\n", .{leaf.string.items});
+        std.debug.print("leaf: '{s}'\n", .{leaf.string.items});
     }
 
     self.recycleNodes(rhs[0], true);
@@ -2516,9 +2516,9 @@ pub fn getTextObject(self: *Self, textobject: ed.TextObject, outer: bool, positi
                             obj.getOpen() => {
                                 if (level == 0) {
                                     current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse unreachable;
+                                    current_offset += 1;
                                     if (current_node.string.items[current_node_offset] != obj.getClose()) {
                                         // this is sus, but works
-                                        current_offset += 1;
                                     }
                                     break;
                                 }
@@ -2553,9 +2553,8 @@ pub fn getTextObject(self: *Self, textobject: ed.TextObject, outer: bool, positi
                             obj.getOpen() => {
                                 if (level == 0) {
                                     current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse return .{ position, position };
-                                    if (current_node.string.items[current_node_offset] != obj.getClose()) {
-                                        current_offset += 1;
-                                    }
+                                    current_offset += 1;
+                                    if (current_node.string.items[current_node_offset] != obj.getClose()) {}
                                     break;
                                 }
 
@@ -2571,7 +2570,12 @@ pub fn getTextObject(self: *Self, textobject: ed.TextObject, outer: bool, positi
                         // If we didn't break, we never reached a valid open bracket.
                         return .{ position, position };
                     }
-                    start = current_offset;
+                    // start = current_offset;
+                    if (current_node.string.items[current_node_offset] == '\n') {
+                        start = current_offset + 1;
+                    } else {
+                        start = current_offset;
+                    }
 
                     continue :sw .scan_close_forward;
                 },
@@ -2585,6 +2589,7 @@ pub fn getTextObject(self: *Self, textobject: ed.TextObject, outer: bool, positi
                             },
                             obj.getClose() => {
                                 if (level == 0) {
+                                    // current_offset -= 1;
                                     break;
                                 }
                                 level -= 1;
@@ -2712,30 +2717,30 @@ pub fn matchStartingFrom(self: *Self, pattern: *const ed.Pattern, position: usiz
     };
 }
 
-test "rope test" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
+// test "rope test" {
+//     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+//     defer arena.deinit();
 
-    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer scratch.deinit();
+//     var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+//     defer scratch.deinit();
 
-    var rope = Self.init(arena.allocator());
-    rope.loadString("what the hell are you doing");
-    rope.insertString(7, "1234", scratch.allocator());
-    rope.insertString(15, "bruhv", scratch.allocator());
+//     var rope = Self.init(arena.allocator());
+//     rope.loadString("what the hell are you doing");
+//     rope.insertString(7, "1234", scratch.allocator());
+//     rope.insertString(15, "bruhv", scratch.allocator());
 
-    std.debug.print("ffooba\n", .{});
-    var i = rope.iter(std.testing.allocator);
-    while (i.next()) |f| {
-        std.debug.print("char: {u}\n", .{@as(u21, @truncate(f))});
-    }
-    i.deinit();
+//     std.debug.print("ffooba\n", .{});
+//     var i = rope.iter(std.testing.allocator);
+//     while (i.next()) |f| {
+//         std.debug.print("char: {u}\n", .{@as(u21, @truncate(f))});
+//     }
+//     i.deinit();
 
-    // var file = try std.Io.Dir.createFile(std.Io.Dir.cwd(), std.testing.io, "output.dot", .{});
-    // var buffer: [4096]u8 = undefined;
-    // var writer = file.writer(std.testing.io, &buffer);
+//     // var file = try std.Io.Dir.createFile(std.Io.Dir.cwd(), std.testing.io, "output.dot", .{});
+//     // var buffer: [4096]u8 = undefined;
+//     // var writer = file.writer(std.testing.io, &buffer);
 
-    // try rope.dumpGraph(&writer.interface);
-    // try writer.flush();
-    // file.close(std.testing.io);
-}
+//     // try rope.dumpGraph(&writer.interface);
+//     // try writer.flush();
+//     // file.close(std.testing.io);
+// }

@@ -1,0 +1,11 @@
+~a build(b: *std.Build) - test before
+~b build(b: *std.Build) - test on open
+~c build(b: *std.Build) - test on inside
+~d build(b: *std.Build) - test on close
+~e (   build(b: *std.Build)   ) - test nested before
+~f (   build(b: *std.Build)   ) - test nested on open
+~g (   build(b: *std.Build)   ) - test nested on close
+~h (   build(b: *std.Build)   ) - test nested on close
+~i {
+    hello
+}

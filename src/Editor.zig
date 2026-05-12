@@ -29,7 +29,7 @@ mode: enum {
 } = .normal,
 
 registers: Registers = .{},
-last_yanked_range: ?ed.View.Selection = null,
+last_yanked_range: ?ed.View.Range = null,
 
 saved_insert_node: ?*ed.Rope.Node = null,
 
@@ -43,6 +43,8 @@ last_find_kind: ToTill = .to,
 pub const ApplicationVtable = struct {
     start_timer: *const fn (data: *anyopaque, id: ed.TimerId, milliseconds: usize) void,
     kill_timer: *const fn (data: *anyopaque, id: ed.TimerId) void,
+    quit: *const fn (data: *anyopaque) void,
+    testing_step: *const fn (data: *anyopaque) void,
 };
 
 pub const ToTill = enum { to, till };
@@ -70,6 +72,16 @@ pub fn init(application: *anyopaque, application_vtable: *const ApplicationVtabl
     };
 }
 
+pub fn initTesting() Self {
+    return .init(&dummy_application, &dummy_application_vtable, std.testing.io, std.testing.allocator);
+}
+
+pub fn quit(self: *Self) void {
+    self.documents.deinit(self.allocator);
+    self.scratch.deinit();
+    self.application_vtable.quit(self.application);
+}
+
 pub fn resize(self: *Self, lines: u32, columns: u32) void {
     self.view.lines = lines;
     self.view.columns = columns;
@@ -85,6 +97,55 @@ pub fn openDocument(self: *Self, path: []const u8) void {
     entry.value_ptr.load(self.io, path);
     self.current_document = next_id;
     self.next_document_id = next_id.increment();
+}
+
+pub fn applyEvents(self: *Self, key_event: []const ed.KeyDownEvent) void {
+    for (key_event) |event| {
+        self.handleEvent(.{ .key_down = event });
+    }
+}
+
+pub fn testMotion(self: *Self, key_event: []const ed.KeyDownEvent, tail: usize, head: usize) !void {
+    self.application_vtable.testing_step(self.application);
+
+    for (key_event) |event| {
+        self.handleEvent(.{ .key_down = event });
+    }
+
+    try std.testing.expectEqual(head, self.view.cursor.head);
+    try std.testing.expectEqual(tail, self.view.cursor.tail);
+}
+
+pub fn testMotionLC(self: *Self, key_event: []const ed.KeyDownEvent, line: usize, column: usize) !void {
+    self.application_vtable.testing_step(self.application);
+
+    for (key_event) |event| {
+        self.handleEvent(.{ .key_down = event });
+    }
+
+    const document = self.documents.getPtr(self.current_document) orelse return;
+    const lc = document.rope.add(self.view.cursor.head, 0, ed.Rope.Coordinate);
+
+    try std.testing.expectEqual(self.view.cursor.tail, self.view.cursor.head);
+    try std.testing.expectEqual(line, lc.line);
+    try std.testing.expectEqual(column, lc.column);
+}
+
+pub fn testMotionLCSplit(self: *Self, key_event: []const ed.KeyDownEvent, tail_line: usize, tail_column: usize, head_line: usize, head_column: usize) !void {
+    self.application_vtable.testing_step(self.application);
+
+    for (key_event) |event| {
+        self.handleEvent(.{ .key_down = event });
+    }
+
+    const document = self.documents.getPtr(self.current_document) orelse return;
+    const tlc = document.rope.add(self.view.cursor.tail, 0, ed.Rope.Coordinate);
+    const hlc = document.rope.add(self.view.cursor.head, 0, ed.Rope.Coordinate);
+
+    try std.testing.expectEqual(head_line, hlc.line);
+    try std.testing.expectEqual(head_column, hlc.column);
+    try std.testing.expectEqual(tail_line, tlc.line);
+    try std.testing.expectEqual(tail_column, tlc.column);
 }
 
 pub fn handleEvent(self: *Self, event: ed.Event) void {
@@ -150,7 +211,9 @@ pub fn handleNormalModeKeydown(self: *Self, event: ed.Event) void {
 
     switch (data.key) {
         .char => {
-            if (data.key == .char and (data.char & 0x7F) == data.char) {
+            if (data.key == .char and data.char == 'q') {
+                self.quit();
+            } else if (data.key == .char and (data.char & 0x7F) == data.char) {
                 _ = keymap.dispatchNormalCommand(&self.key_dispatch_state, (@as(u16, @as(u3, @bitCast(data.modifers))) << 7) | @as(u7, @truncate(data.char)), self);
             }
         },
@@ -551,27 +614,26 @@ pub fn commandEnterVisualLineMode(self: *Self, dispatch: *DispatchState) void {
 }
 
 pub fn commandDeleteMovement(self: *Self, dispatch: *DispatchState) void {
-    const movement_result = self.calculateKeyMovement(dispatch.movement.?, dispatch.chars(), .delete) orelse return;
+    const movement_result = self.calculateKeyMovement(dispatch.movement.?, dispatch.chars()) orelse return;
     const document = self.documents.getPtr(self.current_document) orelse return;
 
-    if (movement_result.selection.tail < self.view.start_position) {
-        const line_column = document.rope.lineColumnFromRelativePosition(movement_result.selection.tail, self.view.start_position).?;
+    if (movement_result.range.start < self.view.start_position) {
+        const line_column = document.rope.lineColumnFromRelativePosition(movement_result.range.start, self.view.start_position).?;
         const lines = @min(line_column.line, self.view.lines / 2);
 
         const new_start_position = document.rope.sub(
-            movement_result.selection.tail,
+            movement_result.range.start,
             ed.Rope.Coordinate{ .line = lines, .column = 0 },
             ed.Rope.Position,
         );
         self.view.start_position = new_start_position;
     }
-    const ordered = movement_result.selection.getOrdered();
-    _ = document.rope.deleteRange(ordered[0], ordered[1] + 1);
+    // const ordered = movement_result.selection.getOrdered();
+    _ = document.rope.deleteRange(movement_result.range.start, movement_result.range.end);
 
-    if (movement_result.linewise) {
-        self.setCursor(movement_result.cursor_position);
-        self.view.max_column = movement_result.max_column;
-    }
+    self.setCursor(movement_result.range.start);
+    const line_range = document.rope.getLineRange(movement_result.range.start).?; // right now this can't return null
+    self.view.max_column = movement_result.range.start - line_range[0];
 }
 
 pub fn commandDeleteLine(self: *Self, dispatch: *DispatchState) void {
@@ -592,39 +654,39 @@ pub fn commandDeleteUnder(self: *Self, dispatch: *DispatchState) void {
 }
 
 pub fn commandChangeMovement(self: *Self, dispatch: *DispatchState) void {
-    const movement_result = self.calculateKeyMovement(dispatch.movement.?, dispatch.chars(), .delete) orelse return;
+    const movement_result = self.calculateKeyMovement(dispatch.movement.?, dispatch.chars()) orelse return;
     const document = self.documents.getPtr(self.current_document) orelse return;
 
-    if (movement_result.selection.tail < self.view.start_position) {
-        const line_column = document.rope.lineColumnFromRelativePosition(movement_result.selection.tail, self.view.start_position).?;
+    if (movement_result.range.start < self.view.start_position) {
+        const line_column = document.rope.lineColumnFromRelativePosition(movement_result.range.start, self.view.start_position).?;
         const lines = @min(line_column.line, self.view.lines / 2);
 
         const new_start_position = document.rope.sub(
-            self.view.cursor.tail,
+            movement_result.range.start,
             ed.Rope.Coordinate{ .line = lines, .column = 0 },
             ed.Rope.Position,
         );
         self.view.start_position = new_start_position;
     }
-    const ordered = movement_result.selection.getOrdered();
-    _ = document.rope.deleteRange(ordered[0], ordered[1] + 1);
+    // const ordered = movement_result.selection.getOrdered();
+    _ = document.rope.deleteRange(movement_result.range.start, movement_result.range.end);
 
-    if (movement_result.linewise) {
-        self.setCursor(movement_result.cursor_position);
-        self.view.max_column = movement_result.max_column;
-    }
+    self.setCursor(movement_result.range.start);
+    const line_range = document.rope.getLineRange(movement_result.range.start).?; // right now this can't return null
+    self.view.max_column = movement_result.range.start - line_range[0];
+
     self.mode = .insert;
 }
 
 pub fn commandYankMovement(self: *Self, dispatch: *DispatchState) void {
-    const movement_result = self.calculateKeyMovement(dispatch.movement.?, dispatch.chars(), .delete) orelse return;
+    const movement_result = self.calculateKeyMovement(dispatch.movement.?, dispatch.chars()) orelse return;
     const document = self.documents.getPtr(self.current_document) orelse return;
 
-    const ordered = movement_result.selection.getOrdered();
-    const slice = document.rope.toOwnedSlice(ordered[0], ordered[1], self.allocator);
+    // const ordered = movement_result.selection.getOrdered();
+    const slice = document.rope.toOwnedSlice(movement_result.range.start, movement_result.range.end, self.allocator);
     self.registers.setRegister('"', slice, movement_result.linewise);
 
-    self.last_yanked_range = movement_result.selection;
+    self.last_yanked_range = movement_result.range;
     self.application_vtable.start_timer(self.application, .yank_highlight, config.yank_highlight_time);
 }
 
@@ -633,14 +695,14 @@ pub fn commandYankLine(self: *Self, dispatch: *DispatchState) void {
     const document = self.documents.getPtr(self.current_document) orelse return;
     const line_range = document.rope.getLineRange(self.view.cursor.head) orelse {
         self.registers.setRegister('"', "", true);
-        self.last_yanked_range = .{ .tail = 0, .head = 0 };
+        self.last_yanked_range = .{ .start = 0, .end = 0 };
         return;
     };
 
     const slice = document.rope.toOwnedSlice(line_range[0], line_range[1], self.allocator);
     self.registers.setRegister('"', slice, true);
 
-    self.last_yanked_range = .{ .tail = line_range[0], .head = line_range[1] };
+    self.last_yanked_range = .{ .start = line_range[0], .end = line_range[1] };
 
     self.application_vtable.start_timer(self.application, .yank_highlight, config.yank_highlight_time);
 }
@@ -653,7 +715,7 @@ pub fn commandVisualYank(self: *Self, dispatch: *DispatchState) void {
     const slice = document.rope.toOwnedSlice(ordered[0], ordered[1] + 1, self.allocator);
     self.registers.setRegister('"', slice, (self.mode == .visual_line));
 
-    self.last_yanked_range = self.view.cursor;
+    self.last_yanked_range = self.view.cursor.toRange();
     self.application_vtable.start_timer(self.application, .yank_highlight, config.yank_highlight_time);
 
     if (self.mode == .visual_line) {
@@ -707,9 +769,9 @@ pub fn commandMoveDownHalfView(self: *Self, dispatch: *DispatchState) void {
 }
 
 pub fn commandMove(self: *Self, dispatch: *DispatchState) void {
-    const movement_result = self.calculateKeyMovement(dispatch.movement.?, dispatch.chars(), .move);
+    const movement_result = self.calculateKeyMovementMove(dispatch.movement.?, dispatch.chars());
     if (movement_result) |move| {
-        self.setCursor(move.selection.head);
+        self.setCursor(move.position);
         if (self.mode != .visual_line) {
             self.view.max_column = move.max_column;
         }
@@ -1197,32 +1259,34 @@ pub fn commandVisualSearchPrev(self: *Self, dispatch: *DispatchState) void {
 }
 
 pub fn commandVisualTextObjectInner(self: *Self, dispatch: *DispatchState) void {
-    const movement_result = self.calculateKeyMovement(.text_object_inner, dispatch.chars(), .move) orelse return;
+    const movement_result = self.calculateKeyMovement(.text_object_inner, dispatch.chars()) orelse return;
 
     const document = self.documents.getPtr(self.current_document) orelse return;
 
     if (self.view.cursor.head < self.view.cursor.tail) {
-        self.adjustViewToCursorPosition(movement_result.selection.tail);
+        self.adjustViewToCursorPosition(movement_result.range.start);
     } else {
-        self.adjustViewToCursorPosition(movement_result.selection.head);
+        self.adjustViewToCursorPosition(movement_result.range.end - 1);
     }
 
     if (self.view.cursor.head != self.view.cursor.tail) {
         if (self.view.cursor.head < self.view.cursor.tail) {
-            self.view.cursor.head = @min(self.view.cursor.head, movement_result.selection.tail);
-            self.view.cursor.tail = @max(self.view.cursor.tail, movement_result.selection.head);
+            if (movement_result.range.start < self.view.cursor.head) {
+                self.view.cursor.head = movement_result.range.start;
+            }
+            if (movement_result.range.end > self.view.cursor.tail) {
+                self.view.cursor.tail = @max(self.view.cursor.head, movement_result.range.end -| 1);
+            }
         } else {
-            self.view.cursor.tail = @min(self.view.cursor.tail, movement_result.selection.tail);
-            self.view.cursor.head = @max(self.view.cursor.head, movement_result.selection.head);
+            if (movement_result.range.start < self.view.cursor.tail) {
+                self.view.cursor.tail = movement_result.range.start;
+            }
+            if (movement_result.range.end > self.view.cursor.head) {
+                self.view.cursor.head = @max(self.view.cursor.tail, movement_result.range.end -| 1);
+            }
         }
     } else {
-        if (self.view.cursor.head < self.view.cursor.tail) {
-            self.view.cursor.head = movement_result.selection.head;
-            self.view.cursor.tail = movement_result.selection.tail;
-        } else {
-            self.view.cursor.tail = movement_result.selection.tail;
-            self.view.cursor.head = movement_result.selection.head;
-        }
+        self.view.cursor = movement_result.range.toSelection();
     }
 
     switch (self.mode) {
@@ -1301,10 +1365,14 @@ pub const Movement = enum {
     // text_object_outer_tick,
 };
 
+pub const KeyMovementMove = struct {
+    position: usize,
+    max_column: usize,
+};
+
 pub const KeyMovement = struct {
-    selection: ed.View.Selection = .{},
-    cursor_position: usize = 0,
-    max_column: usize = 0,
+    range: ed.View.Range = .{},
+    // cursor_position: usize = 0,
     linewise: bool = false,
 };
 
@@ -1331,14 +1399,12 @@ pub fn movementIsDefaultLinewise(movement: Movement) bool {
     };
 }
 
-pub fn calculateKeyMovement(self: *Self, movement: Movement, chars: []const u32, comptime purpose: enum { move, delete }) ?KeyMovement {
+pub fn calculateKeyMovementMove(self: *Self, movement: Movement, chars: []const u32) ?KeyMovementMove {
     const document = self.documents.getPtr(self.current_document) orelse return null;
 
-    var result = KeyMovement{
-        .selection = self.view.cursor,
-        .cursor_position = self.view.cursor.head,
+    var result = KeyMovementMove{
+        .position = self.view.cursor.head,
         .max_column = self.view.max_column,
-        .linewise = movementIsDefaultLinewise(movement),
     };
     switch (movement) {
         .right => {
@@ -1350,22 +1416,18 @@ pub fn calculateKeyMovement(self: *Self, movement: Movement, chars: []const u32,
                     do_max = false;
                 }
             }
-            result.selection.tail = self.view.cursor.tail;
-            result.selection.head = self.view.cursor.head;
-            result.cursor_position = self.view.cursor.head;
+            result.position = self.view.cursor.head + 1;
             if (do_max) result.max_column = self.view.max_column + 1;
         },
         .left => {
             if (self.view.cursor.head > 0) {
-                result.selection.tail = self.view.cursor.tail;
-                result.selection.head = self.view.cursor.head - 1;
-                result.cursor_position = self.view.cursor.head - 1;
+                result.position = self.view.cursor.head - 1;
                 result.max_column = self.view.max_column -| 1;
 
-                if (document.rope.indexNode(result.cursor_position)) |node_and_offset| {
+                if (document.rope.indexNode(self.view.cursor.head)) |node_and_offset| {
                     const char = node_and_offset[0].string.items[node_and_offset[1]];
                     if (char == '\n') {
-                        const line_range = document.rope.getLineRange(result.cursor_position).?; // right now this can't return null
+                        const line_range = document.rope.getLineRange(self.view.cursor.head).?; // right now this can't return null
                         result.max_column = line_range[1] - line_range[0] - 1;
                     }
                 }
@@ -1374,88 +1436,39 @@ pub fn calculateKeyMovement(self: *Self, movement: Movement, chars: []const u32,
         .up => {
             if (self.view.cursor.head > 0) {
                 if (document.rope.getPreviousLineRange(self.view.cursor.head)) |last_line_range| {
-                    switch (purpose) {
-                        .move => {
-                            result.cursor_position = @min(last_line_range[0] + self.view.max_column, last_line_range[1] -| 1);
-                            result.selection.tail = self.view.cursor.tail;
-                            result.selection.head = result.cursor_position;
-                        },
-                        .delete => {
-                            const current_line_range = document.rope.getLineRange(self.view.cursor.head).?;
-                            result.selection.tail = last_line_range[0];
-                            result.selection.head = current_line_range[1];
-
-                            if (last_line_range[0] == 0) {
-                                result.cursor_position = 0;
-                            } else {
-                                const after_line_range = document.rope.getLineRange(current_line_range[1]).?;
-                                result.cursor_position = last_line_range[0] + @min(self.view.max_column, after_line_range[1] - after_line_range[0] - 1);
-                                // result.cursor_position = @min(self.view.max_column, last_line_range[1] - last_line_range[0] - 1);
-                                // result.cursor_position = last_line_range[0];
-                            }
-                        },
-                    }
+                    result.position = @min(last_line_range[0] + self.view.max_column, last_line_range[1] -| 1);
                 }
             }
         },
         .down => {
             if (document.rope.getNextLineRange(self.view.cursor.head)) |next_line_range| {
-                switch (purpose) {
-                    .move => {
-                        result.cursor_position = @min(next_line_range[0] + self.view.max_column, next_line_range[1] -| 1);
-                        result.selection.tail = self.view.cursor.tail;
-                        result.selection.head = result.cursor_position;
-                    },
-                    .delete => {
-                        const current_line_range = document.rope.getLineRange(self.view.cursor.head).?;
-                        result.selection.tail = current_line_range[0];
-                        result.selection.head = next_line_range[1];
-
-                        const after_line_range = document.rope.getLineRange(next_line_range[1]).?;
-                        result.cursor_position = current_line_range[0] + @min(self.view.max_column, after_line_range[1] - after_line_range[0] - 1);
-                    },
-                }
+                result.position = @min(next_line_range[0] + self.view.max_column, next_line_range[1] -| 1);
             }
         },
         .word_forward => {
             const offset = document.rope.getNextWord(self.view.cursor.head);
-            result.cursor_position = self.view.cursor.head + offset;
-            result.selection.tail = self.view.cursor.tail;
-            result.selection.head = result.cursor_position;
+            result.position = self.view.cursor.head + offset;
 
-            const line_range = document.rope.getLineRange(result.cursor_position).?; // right now this can't return null
-            result.max_column = result.cursor_position - line_range[0];
+            const line_range = document.rope.getLineRange(result.position).?; // right now this can't return null
+            result.max_column = result.position - line_range[0];
         },
         .word_backward => {
             const offset = document.rope.getPreviousWord(self.view.cursor.head);
-            result.cursor_position = self.view.cursor.head - offset;
-            result.selection.tail = self.view.cursor.tail;
-            result.selection.head = result.cursor_position;
+            result.position = self.view.cursor.head - offset;
 
-            const line_range = document.rope.getLineRange(result.cursor_position).?; // right now this can't return null
-            result.max_column = result.cursor_position - line_range[0];
+            const line_range = document.rope.getLineRange(result.position).?; // right now this can't return null
+            result.max_column = result.position - line_range[0];
         },
         .word_end_forward => {
             const offset = document.rope.getNextWordEnd(self.view.cursor.head);
-            switch (purpose) {
-                .move => {
-                    result.cursor_position = self.view.cursor.head + offset;
-                },
-                .delete => {
-                    result.cursor_position = self.view.cursor.head + offset + 1;
-                },
-            }
-            result.selection.tail = self.view.cursor.tail;
-            result.selection.head = result.cursor_position; // inclusive
+            result.position = self.view.cursor.head + offset;
 
-            const line_range = document.rope.getLineRange(result.cursor_position).?; // right now this can't return null
-            result.max_column = result.cursor_position - line_range[0];
+            const line_range = document.rope.getLineRange(result.position).?; // right now this can't return null
+            result.max_column = result.position - line_range[0];
         },
         .start_of_line => {
             const line_range = document.rope.getLineRange(self.view.cursor.head).?; // right now this can't return null
-            result.selection.tail = self.view.cursor.tail;
-            result.selection.head = line_range[0];
-            result.cursor_position = line_range[0];
+            result.position = line_range[0];
             result.max_column = 0;
         },
         .start_of_line_non_blank => {
@@ -1473,28 +1486,21 @@ pub fn calculateKeyMovement(self: *Self, movement: Movement, chars: []const u32,
                 current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse break;
             }
 
-            result.cursor_position = current_offset;
-            result.selection.tail = self.view.cursor.tail;
-            result.selection.head = current_offset;
-
-            result.max_column = result.cursor_position - line_range[0];
+            result.position = current_offset;
+            result.max_column = result.position - line_range[0];
         },
         .end_of_line => {
             const line_range = document.rope.getLineRange(self.view.cursor.head).?; // right now this can't return null
-            result.selection.tail = self.view.cursor.tail;
-            result.selection.head = line_range[1];
-            result.max_column = 0;
+            result.position = @max(line_range[0], line_range[1] -| 2);
+            result.max_column = result.position - line_range[0];
         },
         .find_next => {
             const character = chars[0];
             if (self.findCharacter(&document.rope, @truncate(character), true, .to)) |position| {
                 const line_range = document.rope.getLineRange(position).?; // right now this can't return null
 
-                result.cursor_position = position;
-                result.selection.tail = self.view.cursor.tail;
-                result.selection.head = position;
-
-                result.max_column = result.cursor_position - line_range[0];
+                result.position = position;
+                result.max_column = result.position - line_range[0];
             }
         },
         .find_prev => {
@@ -1502,11 +1508,8 @@ pub fn calculateKeyMovement(self: *Self, movement: Movement, chars: []const u32,
             if (self.findCharacter(&document.rope, @truncate(character), false, .to)) |position| {
                 const line_range = document.rope.getLineRange(position).?; // right now this can't return null
 
-                result.cursor_position = position;
-                result.selection.tail = self.view.cursor.tail;
-                result.selection.head = position;
-
-                result.max_column = result.cursor_position - line_range[0];
+                result.position = position;
+                result.max_column = result.position - line_range[0];
             }
         },
         .find_till_next => {
@@ -1514,11 +1517,8 @@ pub fn calculateKeyMovement(self: *Self, movement: Movement, chars: []const u32,
             if (self.findCharacter(&document.rope, @truncate(character), true, .till)) |position| {
                 const line_range = document.rope.getLineRange(position).?; // right now this can't return null
 
-                result.cursor_position = position;
-                result.selection.tail = self.view.cursor.tail;
-                result.selection.head = position;
-
-                result.max_column = result.cursor_position - line_range[0];
+                result.position = position;
+                result.max_column = result.position - line_range[0];
             }
         },
         .find_till_prev => {
@@ -1526,11 +1526,8 @@ pub fn calculateKeyMovement(self: *Self, movement: Movement, chars: []const u32,
             if (self.findCharacter(&document.rope, @truncate(character), false, .till)) |position| {
                 const line_range = document.rope.getLineRange(position).?; // right now this can't return null
 
-                result.cursor_position = position;
-                result.selection.tail = self.view.cursor.tail;
-                result.selection.head = position;
-
-                result.max_column = result.cursor_position - line_range[0];
+                result.position = position;
+                result.max_column = result.position - line_range[0];
             }
         },
         .find_again_next => {
@@ -1538,11 +1535,8 @@ pub fn calculateKeyMovement(self: *Self, movement: Movement, chars: []const u32,
                 if (self.findCharacter(&document.rope, @truncate(lf), true, self.last_find_kind)) |position| {
                     const line_range = document.rope.getLineRange(position).?; // right now this can't return null
 
-                    result.cursor_position = position;
-                    result.selection.tail = self.view.cursor.tail;
-                    result.selection.head = position;
-
-                    result.max_column = result.cursor_position - line_range[0];
+                    result.position = position;
+                    result.max_column = result.position - line_range[0];
                 }
             }
         },
@@ -1551,11 +1545,137 @@ pub fn calculateKeyMovement(self: *Self, movement: Movement, chars: []const u32,
                 if (self.findCharacter(&document.rope, @truncate(lf), false, self.last_find_kind)) |position| {
                     const line_range = document.rope.getLineRange(position).?; // right now this can't return null
 
-                    result.cursor_position = position;
-                    result.selection.tail = self.view.cursor.tail;
-                    result.selection.head = position;
+                    result.position = position;
+                    result.max_column = result.position - line_range[0];
+                }
+            }
+        },
+        .text_object_inner => {},
+        .text_object_outer => {},
+    }
+    return result;
+}
 
-                    result.max_column = result.cursor_position - line_range[0];
+pub fn calculateKeyMovement(self: *Self, movement: Movement, chars: []const u32) ?KeyMovement {
+    const document = self.documents.getPtr(self.current_document) orelse return null;
+
+    // const ordered = self.view.cursor.getOrdered();
+    const cursor = self.view.cursor.head;
+    var result = KeyMovement{
+        .range = .{ .start = cursor, .end = cursor },
+        .linewise = movementIsDefaultLinewise(movement),
+    };
+    switch (movement) {
+        .right => {
+            result.range.start = cursor;
+            result.range.end = cursor + 1;
+        },
+        .left => {
+            if (self.view.cursor.head > 0) {
+                result.range.start = cursor - 1;
+                result.range.end = cursor;
+            }
+        },
+        .up => {
+            if (self.view.cursor.head > 0) {
+                if (document.rope.getPreviousLineRange(self.view.cursor.head)) |last_line_range| {
+                    const current_line_range = document.rope.getLineRange(self.view.cursor.head).?;
+                    result.range.start = last_line_range[0];
+                    result.range.end = current_line_range[1];
+                }
+            }
+        },
+        .down => {
+            if (document.rope.getNextLineRange(self.view.cursor.head)) |next_line_range| {
+                const current_line_range = document.rope.getLineRange(self.view.cursor.head).?;
+                result.range.start = current_line_range[0];
+                result.range.end = next_line_range[1];
+            }
+        },
+        .word_forward => {
+            const offset = document.rope.getNextWord(self.view.cursor.head);
+            result.range.start = cursor;
+            result.range.end = cursor + offset;
+        },
+        .word_backward => {
+            const offset = document.rope.getPreviousWord(self.view.cursor.head);
+            result.range.start = cursor - offset;
+            result.range.end = cursor - 1;
+        },
+        .word_end_forward => {
+            const offset = document.rope.getNextWordEnd(self.view.cursor.head);
+            result.range.start = cursor;
+            result.range.end = cursor + offset + 1;
+        },
+        .start_of_line => {
+            const line_range = document.rope.getLineRange(self.view.cursor.head).?; // right now this can't return null
+            result.range.start = cursor;
+            result.range.end = line_range[0];
+        },
+        .start_of_line_non_blank => {
+            const line_range = document.rope.getLineRange(self.view.cursor.head).?; // right now this can't return null
+
+            var current_offset = line_range[0];
+            var current_node, var current_node_offset = document.rope.indexNode(line_range[0]).?;
+
+            while (current_offset < document.rope.len) : (current_offset += 1) {
+                switch (current_node.string.items[current_node_offset]) {
+                    ' ', '\t', '\r' => {},
+                    else => break,
+                }
+
+                current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse break;
+            }
+
+            result.range.start = cursor;
+            result.range.end = current_offset;
+        },
+        .end_of_line => {
+            const line_range = document.rope.getLineRange(cursor).?; // right now this can't return null
+            result.range.start = cursor;
+            result.range.end = @max(line_range[0], line_range[1] -| 1);
+        },
+        .find_next => {
+            const character = chars[0];
+            if (self.findCharacter(&document.rope, @truncate(character), true, .to)) |position| {
+                result.range.start = cursor;
+                result.range.end = position;
+            }
+        },
+        .find_prev => {
+            const character = chars[0];
+            if (self.findCharacter(&document.rope, @truncate(character), false, .to)) |position| {
+                result.range.start = cursor;
+                result.range.end = position;
+            }
+        },
+        .find_till_next => {
+            const character = chars[0];
+            if (self.findCharacter(&document.rope, @truncate(character), true, .till)) |position| {
+                result.range.start = cursor;
+                result.range.end = position;
+            }
+        },
+        .find_till_prev => {
+            const character = chars[0];
+            if (self.findCharacter(&document.rope, @truncate(character), false, .till)) |position| {
+                result.range.start = cursor;
+                result.range.end = position;
+            }
+        },
+        .find_again_next => {
+            if (self.last_find) |lf| {
+                if (self.findCharacter(&document.rope, @truncate(lf), true, self.last_find_kind)) |position| {
+                    result.range.start = cursor;
+                    result.range.end = position;
+                }
+            }
+        },
+        .find_again_prev => {
+            if (self.last_find) |lf| {
+                if (self.findCharacter(&document.rope, @truncate(lf), false, self.last_find_kind)) |position| {
+                    result.range.start = cursor;
+                    result.range.end = position;
                 }
             }
         },
@@ -1573,23 +1693,240 @@ pub fn calculateKeyMovement(self: *Self, movement: Movement, chars: []const u32,
             }
             const ordered = self.view.cursor.getOrdered();
             const range = document.rope.getTextObject(textobject, false, ordered[0]);
-            result.selection.tail = range[0];
-            result.selection.head = @max(range[1] -| 1, range[0]);
-            switch (purpose) {
-                .delete => {
-                    result.cursor_position = range[0];
-                    result.linewise = true;
-                },
-                .move => {},
-            }
-
-            const line_range = document.rope.getLineRange(result.cursor_position).?; // right now this can't return null
-            result.max_column = result.cursor_position - line_range[0];
+            result.range.start = range[0];
+            result.range.end = range[1];
+            result.linewise = true;
         },
         .text_object_outer => {},
     }
     return result;
 }
+
+// pub fn calculateKeyMovement(self: *Self, movement: Movement, chars: []const u32, comptime purpose: enum { move, delete }) ?KeyMovement {
+//     const document = self.documents.getPtr(self.current_document) orelse return null;
+
+//     var result = KeyMovement{
+//         .selection = self.view.cursor,
+//         .max_column = self.view.max_column,
+//         .linewise = movementIsDefaultLinewise(movement),
+//     };
+//     switch (movement) {
+//         .right => {
+//             var do_max = true;
+//             if (document.rope.indexNode(self.view.cursor.head)) |node_and_offset| {
+//                 const char = node_and_offset[0].string.items[node_and_offset[1]];
+//                 if (char == '\n') {
+//                     result.max_column = 0;
+//                     do_max = false;
+//                 }
+//             }
+//             result.selection.tail = self.view.cursor.tail;
+//             result.selection.head = self.view.cursor.head + 1;
+//             if (do_max) result.max_column = self.view.max_column + 1;
+//         },
+//         .left => {
+//             if (self.view.cursor.head > 0) {
+//                 result.selection.tail = self.view.cursor.tail;
+//                 result.selection.head = self.view.cursor.head - 1;
+//                 result.max_column = self.view.max_column -| 1;
+
+//                 if (document.rope.indexNode(self.view.cursor.head)) |node_and_offset| {
+//                     const char = node_and_offset[0].string.items[node_and_offset[1]];
+//                     if (char == '\n') {
+//                         const line_range = document.rope.getLineRange(self.view.cursor.head).?; // right now this can't return null
+//                         result.max_column = line_range[1] - line_range[0] - 1;
+//                     }
+//                 }
+//             }
+//         },
+//         .up => {
+//             if (self.view.cursor.head > 0) {
+//                 if (document.rope.getPreviousLineRange(self.view.cursor.head)) |last_line_range| {
+//                     switch (purpose) {
+//                         .move => {
+//                             result.selection.tail = self.view.cursor.tail;
+//                             result.selection.head = @min(last_line_range[0] + self.view.max_column, last_line_range[1] -| 1);
+//                         },
+//                         .delete => {
+//                             const current_line_range = document.rope.getLineRange(self.view.cursor.head).?;
+//                             result.selection.head = last_line_range[0];
+//                             result.selection.tail = current_line_range[1];
+//                         },
+//                     }
+//                 }
+//             }
+//         },
+//         .down => {
+//             if (document.rope.getNextLineRange(self.view.cursor.head)) |next_line_range| {
+//                 switch (purpose) {
+//                     .move => {
+//                         result.selection.tail = self.view.cursor.tail;
+//                         result.selection.head = @min(next_line_range[0] + self.view.max_column, next_line_range[1] -| 1);
+//                     },
+//                     .delete => {
+//                         const current_line_range = document.rope.getLineRange(self.view.cursor.head).?;
+//                         result.selection.tail = current_line_range[0];
+//                         result.selection.head = next_line_range[1];
+//                     },
+//                 }
+//             }
+//         },
+//         .word_forward => {
+//             const offset = document.rope.getNextWord(self.view.cursor.head);
+//             result.selection.tail = self.view.cursor.tail;
+//             result.selection.head = self.view.cursor.head + offset;
+
+//             const line_range = document.rope.getLineRange(result.selection.head).?; // right now this can't return null
+//             result.max_column = result.selection.head - line_range[0];
+//         },
+//         .word_backward => {
+//             const offset = document.rope.getPreviousWord(self.view.cursor.head);
+//             result.selection.tail = self.view.cursor.tail;
+//             result.selection.head = self.view.cursor.head - offset;
+
+//             const line_range = document.rope.getLineRange(result.selection.head).?; // right now this can't return null
+//             result.max_column = result.selection.head - line_range[0];
+//         },
+//         .word_end_forward => {
+//             const offset = document.rope.getNextWordEnd(self.view.cursor.head);
+//             switch (purpose) {
+//                 .move => {
+//                     result.selection.head = self.view.cursor.head + offset;
+//                 },
+//                 .delete => {
+//                     result.selection.head = self.view.cursor.head + offset + 1;
+//                 },
+//             }
+//             result.selection.tail = self.view.cursor.tail;
+
+//             const line_range = document.rope.getLineRange(result.selection.head).?; // right now this can't return null
+//             result.max_column = result.selection.head - line_range[0];
+//         },
+//         .start_of_line => {
+//             const line_range = document.rope.getLineRange(self.view.cursor.head).?; // right now this can't return null
+//             result.selection.tail = self.view.cursor.tail;
+//             result.selection.head = line_range[0];
+//             result.max_column = 0;
+//         },
+//         .start_of_line_non_blank => {
+//             const line_range = document.rope.getLineRange(self.view.cursor.head).?; // right now this can't return null
+
+//             var current_offset = line_range[0];
+//             var current_node, var current_node_offset = document.rope.indexNode(line_range[0]).?;
+
+//             while (current_offset < document.rope.len) : (current_offset += 1) {
+//                 switch (current_node.string.items[current_node_offset]) {
+//                     ' ', '\t', '\r' => {},
+//                     else => break,
+//                 }
+
+//                 current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse break;
+//             }
+
+//             result.selection.tail = self.view.cursor.tail;
+//             result.selection.head = current_offset;
+
+//             result.max_column = result.selection.head - line_range[0];
+//         },
+//         .end_of_line => {
+//             const line_range = document.rope.getLineRange(self.view.cursor.head).?; // right now this can't return null
+//             result.selection.tail = self.view.cursor.tail;
+//             result.selection.head = line_range[1];
+//             result.max_column = 0;
+//         },
+//         .find_next => {
+//             const character = chars[0];
+//             if (self.findCharacter(&document.rope, @truncate(character), true, .to)) |position| {
+//                 const line_range = document.rope.getLineRange(position).?; // right now this can't return null
+
+//                 result.selection.tail = self.view.cursor.tail;
+//                 result.selection.head = position;
+//                 result.max_column = result.selection.head - line_range[0];
+//             }
+//         },
+//         .find_prev => {
+//             const character = chars[0];
+//             if (self.findCharacter(&document.rope, @truncate(character), false, .to)) |position| {
+//                 const line_range = document.rope.getLineRange(position).?; // right now this can't return null
+
+//                 result.selection.tail = self.view.cursor.tail;
+//                 result.selection.head = position;
+//                 result.max_column = result.selection.head - line_range[0];
+//             }
+//         },
+//         .find_till_next => {
+//             const character = chars[0];
+//             if (self.findCharacter(&document.rope, @truncate(character), true, .till)) |position| {
+//                 const line_range = document.rope.getLineRange(position).?; // right now this can't return null
+
+//                 result.selection.tail = self.view.cursor.tail;
+//                 result.selection.head = position;
+//                 result.max_column = result.selection.head - line_range[0];
+//             }
+//         },
+//         .find_till_prev => {
+//             const character = chars[0];
+//             if (self.findCharacter(&document.rope, @truncate(character), false, .till)) |position| {
+//                 const line_range = document.rope.getLineRange(position).?; // right now this can't return null
+
+//                 result.selection.tail = self.view.cursor.tail;
+//                 result.selection.head = position;
+//                 result.max_column = result.selection.head - line_range[0];
+//             }
+//         },
+//         .find_again_next => {
+//             if (self.last_find) |lf| {
+//                 if (self.findCharacter(&document.rope, @truncate(lf), true, self.last_find_kind)) |position| {
+//                     const line_range = document.rope.getLineRange(position).?; // right now this can't return null
+
+//                     result.selection.tail = self.view.cursor.tail;
+//                     result.selection.head = position;
+//                     result.max_column = result.selection.head - line_range[0];
+//                 }
+//             }
+//         },
+//         .find_again_prev => {
+//             if (self.last_find) |lf| {
+//                 if (self.findCharacter(&document.rope, @truncate(lf), false, self.last_find_kind)) |position| {
+//                     const line_range = document.rope.getLineRange(position).?; // right now this can't return null
+
+//                     result.selection.tail = self.view.cursor.tail;
+//                     result.selection.head = position;
+//                     result.max_column = result.selection.head - line_range[0];
+//                 }
+//             }
+//         },
+//         .text_object_inner => {
+//             const character = chars[0];
+//             const textobject = ed.TextObject.fromChar(character) orelse return result;
+//             switch (self.mode) {
+//                 .visual_line => {
+//                     switch (textobject) {
+//                         .paren, .bracket, .brace => self.mode = .visual,
+//                         else => {},
+//                     }
+//                 },
+//                 else => {},
+//             }
+//             const ordered = self.view.cursor.getOrdered();
+//             const range = document.rope.getTextObject(textobject, false, ordered[0]);
+//             result.selection.tail = range[0];
+//             result.selection.head = @max(range[1] -| 1, range[0]);
+//             // result.selection.head = range[1];
+//             switch (purpose) {
+//                 .delete => {
+//                     result.linewise = true;
+//                 },
+//                 .move => {},
+//             }
+
+//             const line_range = document.rope.getLineRange(result.selection.head).?; // right now this can't return null
+//             result.max_column = result.selection.head - line_range[0];
+//         },
+//         .text_object_outer => {},
+//     }
+//     return result;
+// }
 
 pub fn findCharacter(self: *Self, rope: *ed.Rope, character: u8, comptime forwards: bool, kind: ToTill) ?usize {
     self.last_find = character;
@@ -1597,7 +1934,7 @@ pub fn findCharacter(self: *Self, rope: *ed.Rope, character: u8, comptime forwar
 
     const view_end = rope.add(
         self.view.start_position,
-        ed.Rope.Coordinate{ .line = self.view.lines + 1, .column = 0 },
+        ed.Rope.Coordinate{ .line = self.view.lines + 1, .column = std.math.maxInt(u32) },
         ed.Rope.Position,
     );
     var current_offset = if (forwards)
@@ -1753,6 +2090,230 @@ pub fn render(self: *Self, area: ed.Rect, renderer: *ed.Renderer) void {
                 }
                 x += 1;
             }
+
+            var number_buf: [16]u8 = undefined;
+            const number = std.fmt.bufPrint(&number_buf, "{:6}", .{self.view.cursor.head}) catch @panic("buffer to small!");
+            x = @as(u16, @truncate(area.right)) - @as(u16, @truncate(number.len)) - 2;
+
+            for (number) |c| {
+                renderer.place_glyph(x, y, &.{@as(u16, c)}, .white, .init(20, 20, 20), .init(0, 0, 0), .none, .hidden);
+                x += 1;
+            }
+            renderer.place_glyph(x, y, &.{' '}, .white, .init(20, 20, 20), .init(0, 0, 0), .none, .hidden);
         }
     }
+}
+
+var dummy_application: void = {};
+var dummy_application_vtable: ApplicationVtable = .{
+    .start_timer = dummy_start_timer,
+    .kill_timer = dummy_kill_timer,
+    .quit = dummy_quit,
+    .testing_step = dummy_step,
+};
+
+fn dummy_start_timer(app: *anyopaque, id: ed.TimerId, milliseconds: usize) void {
+    _ = app;
+    _ = id;
+    _ = milliseconds;
+}
+
+fn dummy_kill_timer(app: *anyopaque, id: ed.TimerId) void {
+    _ = app;
+    _ = id;
+}
+
+fn dummy_quit(app: *anyopaque) void {
+    _ = app;
+}
+
+fn dummy_step(app: *anyopaque) void {
+    _ = app;
+}
+
+pub const TestApp = struct {
+    app: ?*ed.Application = null,
+    editor: *ed.Editor,
+
+    pub const debug = false;
+
+    pub fn create(file_path: []const u8, src: std.builtin.SourceLocation) TestApp {
+        if (debug) {
+            const application = ed.Application.createTesting(file_path, src);
+            const editor = application.getEditor();
+            return .{ .app = application, .editor = editor };
+        } else {
+            const editor = std.testing.allocator.create(ed.Editor) catch @panic("OOM");
+            editor.* = Self.initTesting();
+            editor.resize(50, 80);
+            editor.openDocument(file_path);
+            return .{ .app = null, .editor = editor };
+        }
+    }
+
+    pub fn deinit(app: *TestApp) void {
+        if (app.app) |a| a.deinit();
+        app.editor.quit();
+        if (app.app == null) {
+            std.testing.allocator.destroy(app.editor);
+        }
+    }
+};
+
+// const document = editor.documents.getPtr(editor.current_document).?;
+// var node_iter = document.rope.nodeIter();
+// while (node_iter.next()) |node| {
+//     std.debug.print("node: '{s}'\n", .{node.string.items});
+// };
+
+test "Editor - Motion" {
+    var testapp = TestApp.create("test/test1", @src());
+    defer testapp.deinit();
+    const editor = testapp.editor;
+
+    try editor.testMotion(&.{.{ .char = 'l' }}, 1, 1);
+    try editor.testMotion(&.{.{ .char = 'h' }}, 0, 0);
+    try editor.testMotion(&.{.{ .char = 'k' }}, 0, 0);
+    try editor.testMotion(&.{.{ .char = 'j' }}, 21, 21);
+    try editor.testMotion(&.{.{ .char = 'l' }}, 22, 22);
+    try editor.testMotion(&.{.{ .char = 'k' }}, 1, 1);
+
+    try editor.testMotion(&.{.{ .char = 'w' }}, 6, 6);
+    try editor.testMotion(&.{.{ .char = 'w' }}, 9, 9);
+    try editor.testMotion(&.{.{ .char = 'e' }}, 13, 13);
+    try editor.testMotion(&.{.{ .char = 'b' }}, 9, 9);
+    try editor.testMotion(&.{.{ .char = 'w' }}, 15, 15);
+    try editor.testMotion(&.{.{ .char = 'w' }}, 21, 21);
+
+    try editor.testMotion(&.{ .{ .char = 'f' }, .{ .char = '@' } }, 27, 27);
+    try editor.testMotion(&.{.{ .char = '_' }}, 21, 21);
+    try editor.testMotion(&.{ .{ .char = 't' }, .{ .char = '@' } }, 26, 26);
+    try editor.testMotion(&.{ .{ .char = 'F' }, .{ .char = '=' } }, 25, 25);
+    try editor.testMotion(&.{.{ .char = '$' }}, 41, 41);
+
+    try editor.testMotion(&.{.{ .char = 'j' }}, 43, 43);
+    try editor.testMotion(&.{.{ .char = 'j' }}, 64, 64);
+    try editor.testMotion(&.{.{ .char = 'j' }}, 99, 99);
+    try editor.testMotion(&.{.{ .char = 'j' }}, 146, 146);
+    try editor.testMotion(&.{.{ .char = '_' }}, 130, 130);
+    try editor.testMotion(&.{.{ .char = '0' }}, 126, 126);
+}
+
+test "Editor - Delete Motion" {
+    var testapp = TestApp.create("test/test1", @src());
+    defer testapp.deinit();
+    const editor = testapp.editor;
+
+    try editor.testMotion(&.{ .{ .char = 'd' }, .{ .char = 'l' } }, 0, 0);
+    try editor.testMotion(&.{.{ .char = 'j' }}, 20, 20);
+    try editor.testMotion(&.{ .{ .char = 'd' }, .{ .char = 'k' } }, 0, 0);
+
+    try editor.testMotion(&.{.{ .char = 'j' }}, 1, 1);
+    try editor.testMotion(&.{.{ .char = 'w' }}, 5, 5);
+    try editor.testMotion(&.{ .{ .char = 'f' }, .{ .char = 'b' } }, 8, 8);
+    try editor.testMotion(&.{ .{ .char = 'd' }, .{ .char = 'w' } }, 8, 8);
+    try editor.testMotion(&.{ .{ .char = 't' }, .{ .char = 'b' } }, 8, 8);
+
+    try editor.testMotion(&.{ .{ .char = 'f' }, .{ .char = '*' } }, 12, 12);
+    try editor.testMotion(&.{.{ .char = 'l' }}, 13, 13);
+    try editor.testMotion(&.{ .{ .char = 'd' }, .{ .char = 'e' } }, 13, 13);
+    try editor.testMotion(&.{ .{ .char = 't' }, .{ .char = 'B' } }, 13, 13);
+
+    try editor.testMotion(&.{ .{ .char = 'd' }, .{ .char = '$' } }, 13, 13);
+    try editor.testMotion(&.{.{ .char = '$' }}, 12, 12);
+    try editor.testMotion(&.{ .{ .char = 'f' }, .{ .char = 'c' } }, 16, 16);
+}
+
+test "Editor - Delete TextObject" {
+    var testapp = TestApp.create("test/test_textobject", @src());
+    defer testapp.deinit();
+    const editor = testapp.editor;
+
+    editor.applyEvents(&.{ .{ .char = 'f' }, .{ .char = 'a' } });
+    try editor.testMotionLC(&.{ .{ .char = 'd' }, .{ .char = 'i' }, .{ .char = '(' } }, 0, 9);
+    try editor.testMotionLC(&.{ .{ .char = 'd' }, .{ .char = 'i' }, .{ .char = ')' } }, 0, 9);
+    try editor.testMotionLC(&.{ .{ .char = 'f' }, .{ .char = '-' } }, 0, 11);
+
+    editor.applyEvents(&.{ .{ .char = 'f' }, .{ .char = '~' } });
+    try editor.testMotionLC(&.{ .{ .char = 'f' }, .{ .char = '(' } }, 1, 8);
+    try editor.testMotionLC(&.{ .{ .char = 'd' }, .{ .char = 'i' }, .{ .char = '(' } }, 1, 9);
+    try editor.testMotionLC(&.{ .{ .char = 'd' }, .{ .char = 'i' }, .{ .char = ')' } }, 1, 9);
+    try editor.testMotionLC(&.{ .{ .char = 'f' }, .{ .char = '-' } }, 1, 11);
+
+    editor.applyEvents(&.{ .{ .char = 'f' }, .{ .char = '~' } });
+    editor.applyEvents(&.{ .{ .char = 'f' }, .{ .char = '*' } });
+    try editor.testMotionLC(&.{ .{ .char = 'd' }, .{ .char = 'i' }, .{ .char = '(' } }, 2, 9);
+    try editor.testMotionLC(&.{ .{ .char = 'd' }, .{ .char = 'i' }, .{ .char = ')' } }, 2, 9);
+    try editor.testMotionLC(&.{ .{ .char = 'f' }, .{ .char = '-' } }, 2, 11);
+
+    try editor.testMotionLC(&.{ .{ .char = 'f' }, .{ .char = ')' } }, 3, 22);
+    try editor.testMotionLC(&.{ .{ .char = 'd' }, .{ .char = 'i' }, .{ .char = '(' } }, 3, 9);
+    try editor.testMotionLC(&.{ .{ .char = 'd' }, .{ .char = 'i' }, .{ .char = ')' } }, 3, 9);
+    try editor.testMotionLC(&.{ .{ .char = 'f' }, .{ .char = '-' } }, 3, 11);
+
+    editor.applyEvents(&.{ .{ .char = 'f' }, .{ .char = '~' } });
+    try editor.testMotionLC(&.{ .{ .char = 'd' }, .{ .char = 'i' }, .{ .char = '(' } }, 4, 4);
+    try editor.testMotionLC(&.{ .{ .char = 'd' }, .{ .char = 'i' }, .{ .char = ')' } }, 4, 4);
+    try editor.testMotionLC(&.{ .{ .char = 'f' }, .{ .char = '-' } }, 4, 6);
+
+    editor.applyEvents(&.{ .{ .char = 'f' }, .{ .char = '~' } });
+    editor.applyEvents(&.{ .{ .char = 'f' }, .{ .char = 'b' } });
+    try editor.testMotionLC(&.{ .{ .char = 'd' }, .{ .char = 'i' }, .{ .char = '(' } }, 5, 4);
+    try editor.testMotionLC(&.{ .{ .char = 'd' }, .{ .char = 'i' }, .{ .char = ')' } }, 5, 4);
+    try editor.testMotionLC(&.{ .{ .char = 'f' }, .{ .char = '-' } }, 5, 6);
+
+    editor.applyEvents(&.{ .{ .char = 'f' }, .{ .char = '~' } });
+    try editor.testMotionLC(&.{ .{ .char = 'f' }, .{ .char = ')' } }, 6, 26);
+    try editor.testMotionLC(&.{ .{ .char = 'f' }, .{ .char = ')' } }, 6, 30);
+    try editor.testMotionLC(&.{ .{ .char = 'd' }, .{ .char = 'i' }, .{ .char = '(' } }, 6, 4);
+    try editor.testMotionLC(&.{ .{ .char = 'd' }, .{ .char = 'i' }, .{ .char = ')' } }, 6, 4);
+}
+
+test "Editor - Visual Motion" {
+    var testapp = TestApp.create("test/test1", @src());
+    defer testapp.deinit();
+    const editor = testapp.editor;
+
+    try editor.testMotion(&.{ .{ .char = 'v' }, .{ .char = 'l' } }, 0, 1);
+    try editor.testMotion(&.{.{ .char = 'h' }}, 0, 0);
+    try editor.testMotion(&.{.{ .char = 'k' }}, 0, 0);
+    try editor.testMotion(&.{.{ .char = 'j' }}, 0, 21);
+    try editor.testMotion(&.{.{ .char = 'l' }}, 0, 22);
+    try editor.testMotion(&.{.{ .char = 'k' }}, 0, 1);
+
+    try editor.testMotion(&.{.{ .char = 'w' }}, 0, 6);
+    try editor.testMotion(&.{.{ .char = 'w' }}, 0, 9);
+    try editor.testMotion(&.{.{ .char = 'e' }}, 0, 13);
+    try editor.testMotion(&.{.{ .char = 'b' }}, 0, 9);
+    try editor.testMotion(&.{.{ .char = 'w' }}, 0, 15);
+    try editor.testMotion(&.{.{ .char = 'w' }}, 0, 21);
+
+    try editor.testMotion(&.{ .{ .char = 'f' }, .{ .char = '@' } }, 0, 27);
+    try editor.testMotion(&.{.{ .char = '_' }}, 0, 21);
+    try editor.testMotion(&.{ .{ .char = 't' }, .{ .char = '@' } }, 0, 26);
+    try editor.testMotion(&.{ .{ .char = 'F' }, .{ .char = '=' } }, 0, 25);
+    try editor.testMotion(&.{.{ .char = '$' }}, 0, 41);
+
+    try editor.testMotion(&.{.{ .char = 'j' }}, 0, 43);
+    try editor.testMotion(&.{.{ .char = 'j' }}, 0, 64);
+}
+
+test "Editor - Visual Text Objects" {
+    var testapp = TestApp.create("test/test_textobject", @src());
+    defer testapp.deinit();
+    const editor = testapp.editor;
+
+    editor.applyEvents(&.{ .{ .char = 'f' }, .{ .char = 'a' } });
+    try editor.testMotionLCSplit(&.{ .{ .char = 'v' }, .{ .char = 'i' }, .{ .char = '(' } }, 0, 9, 0, 21);
+    try editor.testMotionLCSplit(&.{ .{ .char = 'i' }, .{ .char = '(' } }, 0, 9, 0, 21);
+    try editor.testMotionLC(&.{.{ .key = .escape }}, 0, 21);
+    editor.applyEvents(&.{ .{ .char = 'v' }, .{ .char = 'h' } });
+    try editor.testMotionLCSplit(&.{ .{ .char = 'i' }, .{ .char = '(' } }, 0, 21, 0, 9);
+    try editor.testMotionLCSplit(&.{ .{ .char = 'i' }, .{ .char = '(' } }, 0, 21, 0, 9);
+    try editor.testMotionLC(&.{.{ .key = .escape }}, 0, 9);
+
+    try editor.testMotionLC(&.{ .{ .char = '0' }, .{ .char = 'j' }, .{ .char = 'j' }, .{ .char = 'j' }, .{ .char = 'j' }, .{ .char = 'j' }, .{ .char = 'j' }, .{ .char = 'j' }, .{ .char = 'j' } }, 8, 0);
+    try editor.testMotionLCSplit(&.{ .{ .char = 'v' }, .{ .char = 'i' }, .{ .char = '{' } }, 9, 0, 9, 9);
+    try editor.testMotionLC(&.{.{ .key = .escape }}, 9, 21);
+    try editor.testMotionLCSplit(&.{ .{ .char = 'v' }, .{ .char = 'i' }, .{ .char = '{' } }, 9, 0, 9, 9);
 }
