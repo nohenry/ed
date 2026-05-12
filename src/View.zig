@@ -6,6 +6,10 @@ pub const Range = struct {
     /// excluisve
     end: usize = 0,
 
+    pub inline fn init(start: usize, end: usize) Range {
+        return .{ .start = start, .end = end };
+    }
+
     pub inline fn containsPosition(self: @This(), position: usize) bool {
         return position >= self.start and position < self.end;
     }
