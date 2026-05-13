@@ -2444,54 +2444,141 @@ pub fn getPreviousWord(self: *Self, position: usize) usize {
     return position - current_offset;
 }
 
-pub fn getTextObject(self: *Self, textobject: ed.TextObject, outer: bool, position: usize) struct { usize, usize } {
+pub fn getTextObject(self: *Self, textobject: ed.TextObject, comptime outer: bool, position: usize) struct { usize, usize } {
     var current_offset = position;
     const start_node, const start_node_offset = self.indexNode(current_offset).?;
-    var has_been_valid = false;
-    var has_been_invalid = false;
 
     switch (textobject) {
-        inline .word, .WORD, .double_quote, .single_quote, .backtick => |obj| {
+        inline .word, .WORD => |obj| {
             var current_node, var current_node_offset = .{ start_node, start_node_offset };
 
-            while (current_offset > 0) : (current_offset -= 1) {
-                const char = current_node.string.items[current_node_offset];
-                if (ed.TextObject.isValid(obj, char)) {
-                    if (has_been_invalid) {
-                        current_offset += 1;
-                        break;
-                    }
-                    has_been_valid = true;
-                } else {
-                    if (has_been_valid) {
-                        current_offset += 1;
-                        break;
-                    }
-                    has_been_invalid = true;
-                }
-                current_node, current_node_offset = current_node.previousNodeChar(current_node_offset) orelse break;
-            }
-            const start = current_offset;
+            const starts_with_whitespace = std.ascii.isWhitespace(current_node.string.items[current_node_offset]);
+            var start = current_offset;
+            var end = current_offset;
+            var do_trailing_whitespace = true;
+            var word_start = position;
+            sw: switch (@as(
+                enum {
+                    scan_word_backward,
+                    scan_word_forward,
+                    scan_whitespace_backward,
+                    scan_whitespace_backward_fallback,
+                    scan_whitespace_forward,
+                },
+                if (starts_with_whitespace and outer) .scan_whitespace_backward else .scan_word_backward,
+            )) {
+                .scan_whitespace_backward, .scan_whitespace_backward_fallback => |state| blk: {
+                    do_trailing_whitespace = false;
 
-            current_offset = position;
-            current_node, current_node_offset = .{ start_node, start_node_offset };
-            while (current_offset < self.len) : (current_offset += 1) {
-                if (ed.TextObject.isValid(obj, current_node.string.items[current_node_offset])) {
-                    if (!has_been_valid) {
-                        break;
+                    while (current_offset > 0) : (current_offset -= 1) {
+                        const char = current_node.string.items[current_node_offset];
+                        switch (char) {
+                            ' ', '\t', '\n', '\r' => {},
+                            else => {
+                                start = current_offset + 1;
+                                current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse break;
+                                current_offset += 1;
+                                break;
+                            },
+                        }
+                        current_node, current_node_offset = current_node.previousNodeChar(current_node_offset) orelse break;
+                    } else {
+                        start = current_offset;
                     }
-                } else {
-                    if (has_been_valid) {
-                        break;
-                    }
-                }
-                current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse break;
-            }
-            const end = current_offset;
 
+                    if (state == .scan_whitespace_backward_fallback) {
+                        // this state is when we've already scanned forward the word, and there is no trailing whitespace.
+                        break :blk;
+                    }
+
+                    while (current_offset < self.len) : (current_offset += 1) {
+                        const char = current_node.string.items[current_node_offset];
+                        switch (char) {
+                            ' ', '\t', '\n', '\r' => {},
+                            else => {
+                                end = current_offset + 1;
+                                word_start = current_offset;
+                                break;
+                            },
+                        }
+                        current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse break;
+                    } else {
+                        end = current_offset;
+                        word_start = current_offset;
+                    }
+
+                    continue :sw .scan_word_forward;
+                },
+                .scan_whitespace_forward => {
+                    while (current_offset < self.len) : (current_offset += 1) {
+                        const char = current_node.string.items[current_node_offset];
+                        switch (char) {
+                            ' ', '\t' => {},
+                            else => {
+                                end = current_offset;
+                                break;
+                            },
+                        }
+                        current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse break;
+                    } else {
+                        end = current_offset;
+                    }
+                },
+                .scan_word_backward => {
+                    while (current_offset > 0) : (current_offset -= 1) {
+                        const char = current_node.string.items[current_node_offset];
+                        if (!obj.isValid(char)) {
+                            start = current_offset + 1;
+                            word_start = current_offset + 1;
+                            current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse break;
+                            current_offset += 1;
+                            break;
+                        }
+                        current_node, current_node_offset = current_node.previousNodeChar(current_node_offset) orelse break;
+                    } else {
+                        start = current_offset;
+                        word_start = current_offset;
+                    }
+
+                    continue :sw .scan_word_forward;
+                },
+                .scan_word_forward => {
+                    while (current_offset < self.len) : (current_offset += 1) {
+                        const char = current_node.string.items[current_node_offset];
+                        if (!obj.isValid(char)) {
+                            end = current_offset;
+
+                            if (outer) {
+                                if (do_trailing_whitespace) {
+                                    if (switch (current_node.string.items[current_node_offset]) {
+                                        ' ', '\t' => true,
+                                        else => false,
+                                    }) {
+                                        continue :sw .scan_whitespace_forward;
+                                    } else {
+                                        if (word_start > 0) {
+                                            // if no leading whitespace, if we're not at the start, we scan leading whitespace backwards.
+                                            current_offset = word_start - 1;
+                                            const word_start_node, const word_start_node_offset = self.indexNode(current_offset).?;
+                                            current_node = word_start_node;
+                                            current_node_offset = word_start_node_offset;
+                                            continue :sw .scan_whitespace_backward_fallback;
+                                        }
+                                    }
+                                }
+                            }
+
+                            break;
+                        }
+                        current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse break;
+                    } else {
+                        end = current_offset;
+                    }
+                },
+            }
             return .{ start, end };
         },
-        inline .paren, .bracket, .brace => |obj| {
+        inline .paren, .bracket, .brace, .double_quote, .single_quote, .backtick => |obj| {
             var current_node, var current_node_offset = .{ start_node, start_node_offset };
             var level: i32 = 0;
 

@@ -694,6 +694,13 @@ pub const Renderer = struct {
         self.refresh();
     }
 
+    pub fn force_resize(self: *@This(), width: u32, height: u32) void {
+        self.terminal_width = width;
+        self.terminal_height = height;
+
+        self.refresh();
+    }
+
     pub fn reconfigure(self: @This(), config: anytype) void {
         self.config = config;
         self.refresh();
