@@ -123,6 +123,23 @@ pub const TextObject = enum {
 pub const Key = enum {
     char,
     escape,
+    backspace,
+    enter,
+    left,
+    right,
+    up,
+    down,
+    home,
+    end,
+    page_up,
+    page_down,
+    tab,
+    delete,
+    insert,
+    scroll_lock,
+    num_lock,
+    print_screen,
+    pause,
 };
 pub const KeyModifiers = packed struct(u3) {
     ctrl: u1 = 0,

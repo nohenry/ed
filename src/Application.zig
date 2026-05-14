@@ -71,20 +71,49 @@ fn createWindowProc(comptime handleEvent_: fn (application: *Application, event:
                     //              the right window message it should be done in.
                     _ = win32.UpdateWindow(hwnd);
                 },
-                win32.WM_KEYDOWN => {
-                    const event: ?ed.Event = switch (wparam) {
-                        win32.VK_ESCAPE => .{
-                            .key_down = .{
-                                .key = .escape,
-                                .char = 0,
-                                .modifers = .{
-                                    .ctrl = if (@as(u16, @bitCast(win32.GetKeyState(win32.VK_CONTROL))) & 0x8000 > 0) 1 else 0,
-                                    // .shift = if (@as(u16, @bitCast(win32.GetKeyState(win32.VK_SHIFT))) & 0x8000 > 0) 1 else 0,
-                                    .shift = 0,
-                                    .alt = if (@as(u16, @bitCast(win32.GetKeyState(win32.VK_MENU))) & 0x8000 > 0) 1 else 0,
+                win32.WM_SYSCOMMAND => {
+                    // this prevents Alt commands from beeping
+                    if (wparam == win32.SC_KEYMENU) {
+                        return 0;
+                    }
+                },
+                win32.WM_INITMENU, win32.WM_MENUCHAR, win32.WM_ENTERMENULOOP => return 0,
+                win32.WM_SYSKEYDOWN, win32.WM_KEYDOWN => {
+                    const create_key = struct {
+                        pub fn create(key: ed.Key) ed.Event {
+                            return .{
+                                .key_down = .{
+                                    .key = key,
+                                    .char = 0,
+                                    .modifers = .{
+                                        .ctrl = if (@as(u16, @bitCast(win32.GetKeyState(win32.VK_CONTROL))) & 0x8000 > 0) 1 else 0,
+                                        // .shift = if (@as(u16, @bitCast(win32.GetKeyState(win32.VK_SHIFT))) & 0x8000 > 0) 1 else 0,
+                                        .shift = 0,
+                                        .alt = if (@as(u16, @bitCast(win32.GetKeyState(win32.VK_MENU))) & 0x8000 > 0) 1 else 0,
+                                    },
                                 },
-                            },
-                        },
+                            };
+                        }
+                    }.create;
+                    const event: ?ed.Event = switch (wparam) {
+                        win32.VK_ESCAPE => create_key(.escape),
+                        win32.VK_BACK => create_key(.backspace),
+                        win32.VK_RETURN => create_key(.enter),
+                        win32.VK_LEFT => create_key(.left),
+                        win32.VK_RIGHT => create_key(.right),
+                        win32.VK_UP => create_key(.up),
+                        win32.VK_DOWN => create_key(.down),
+                        win32.VK_HOME => create_key(.home),
+                        win32.VK_END => create_key(.end),
+                        win32.VK_NAVIGATION_UP => create_key(.page_up),
+                        win32.VK_NAVIGATION_DOWN => create_key(.page_down),
+                        win32.VK_TAB => create_key(.tab),
+                        win32.VK_DELETE => create_key(.delete),
+                        win32.VK_INSERT => create_key(.insert),
+                        win32.VK_SCROLL => create_key(.scroll_lock),
+                        win32.VK_NUMLOCK => create_key(.num_lock),
+                        win32.VK_PRINT => create_key(.print_screen),
+                        win32.VK_PAUSE => create_key(.pause),
                         else => blk: {
                             var keystate: [256]u8 = undefined;
                             _ = win32.GetKeyboardState(&keystate[0]);

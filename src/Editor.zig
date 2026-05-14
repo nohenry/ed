@@ -26,6 +26,8 @@ mode: enum {
     normal,
     visual,
     visual_line,
+    search,
+    command,
 } = .normal,
 
 registers: Registers = .{},
@@ -39,6 +41,11 @@ matcher: ?ed.Rope.Matcher = null,
 
 last_find: ?u32 = null,
 last_find_kind: ToTill = .to,
+
+/// Input buffer for search and command input
+line_input_buffer: std.ArrayList(u8) = .empty,
+line_input_cursor: usize = 0,
+line_input_view_start: usize = 0,
 
 pub const ApplicationVtable = struct {
     start_timer: *const fn (data: *anyopaque, id: ed.TimerId, milliseconds: usize) void,
@@ -155,6 +162,8 @@ pub fn handleEvent(self: *Self, event: ed.Event) void {
                 .insert => self.handleInsertModeKeydown(event),
                 .normal => self.handleNormalModeKeydown(event),
                 .visual, .visual_line => self.handleVisualModeKeydown(event),
+                .search => self.handleSearchKeydown(event),
+                .command => self.handleCommandKeydown(event),
             }
         },
         .timer => |timer_id| {
@@ -203,6 +212,7 @@ pub fn handleInsertModeKeydown(self: *Self, event: ed.Event) void {
                 self.view.max_column = self.view.cursor.head - line_range[0];
             }
         },
+        else => {},
     }
 }
 
@@ -222,6 +232,7 @@ pub fn handleNormalModeKeydown(self: *Self, event: ed.Event) void {
             self.view.cursor.tail = self.view.cursor.head;
             self.mode = .normal;
         },
+        else => {},
     }
 }
 
@@ -246,6 +257,89 @@ pub fn handleVisualModeKeydown(self: *Self, event: ed.Event) void {
 
             self.mode = .normal;
         },
+        else => {},
+    }
+}
+
+pub fn handleSearchKeydown(self: *Self, event: ed.Event) void {
+    const data = event.key_down;
+
+    switch (data.key) {
+        .char => {
+            if ((data.char & 0x7F) == data.char) {
+                const key_result = keymap.dispatchLineInputCommand(&self.key_dispatch_state, (@as(u16, @as(u3, @bitCast(data.modifers))) << 7) | @as(u7, @truncate(data.char)), self);
+
+                if (key_result == .not_mapped) {
+                    const ch: u8 = @truncate(data.char & 0x7F);
+                    if (std.ascii.isPrint(ch)) {
+                        self.line_input_buffer.insert(self.allocator, self.line_input_cursor, ch) catch @panic("OOM");
+                        self.line_input_cursor += 1;
+                    }
+                }
+            }
+        },
+        .left => {
+            self.line_input_cursor -|= 1;
+        },
+        .right => {
+            self.line_input_cursor = @min(self.line_input_cursor + 1, self.line_input_buffer.items.len);
+        },
+        .backspace => {
+            if (self.line_input_cursor > 0) {
+                if (data.modifers.alt > 0) {
+                    var dispatch = keymap.DispatchState(Movement){};
+                    self.commandLineInputDeleteWordBackward(&dispatch);
+                } else {
+                    _ = self.line_input_buffer.orderedRemove(self.line_input_cursor - 1);
+                    self.line_input_cursor -= 1;
+                }
+            }
+        },
+        .escape => {
+            self.mode = .normal;
+        },
+        else => {},
+    }
+}
+
+pub fn handleCommandKeydown(self: *Self, event: ed.Event) void {
+    const data = event.key_down;
+
+    switch (data.key) {
+        .char => {
+            if ((data.char & 0x7F) == data.char) {
+                const key_result = keymap.dispatchLineInputCommand(&self.key_dispatch_state, (@as(u16, @as(u3, @bitCast(data.modifers))) << 7) | @as(u7, @truncate(data.char)), self);
+
+                if (key_result == .not_mapped) {
+                    const ch: u8 = @truncate(data.char & 0x7F);
+                    if (std.ascii.isPrint(ch)) {
+                        self.line_input_buffer.insert(self.allocator, self.line_input_cursor, ch) catch @panic("OOM");
+                        self.line_input_cursor += 1;
+                    }
+                }
+            }
+        },
+        .left => {
+            self.line_input_cursor -|= 1;
+        },
+        .right => {
+            self.line_input_cursor = @min(self.line_input_cursor + 1, self.line_input_buffer.items.len);
+        },
+        .backspace => {
+            if (self.line_input_cursor > 0) {
+                if (data.modifers.alt > 0) {
+                    var dispatch = keymap.DispatchState(Movement){};
+                    self.commandLineInputDeleteWordBackward(&dispatch);
+                } else {
+                    _ = self.line_input_buffer.orderedRemove(self.line_input_cursor - 1);
+                    self.line_input_cursor -= 1;
+                }
+            }
+        },
+        .escape => {
+            self.mode = .normal;
+        },
+        else => {},
     }
 }
 
@@ -323,6 +417,7 @@ pub fn setCursor(self: *Self, position: usize) void {
             //     self.view.cursor.head = line_range[1] -| 1;
             // }
         },
+        .command, .search => @panic("invalid mode"),
     }
 }
 
@@ -406,7 +501,163 @@ pub fn adjustViewToCursorPosition(self: *Self, cursor_position: usize) void {
     self.view.start_position = @min(line_range[0], max_pos);
 }
 
+// ********************* LINE INPUT COMMANDS *********************
+
+pub fn commandLineInputStartOfLine(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
+    self.line_input_cursor = 0;
+}
+
+pub fn commandLineInputEndOfLine(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
+    self.line_input_cursor = self.line_input_buffer.items.len;
+}
+
+pub fn commandLineInputLeft(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
+    self.line_input_cursor -|= 1;
+}
+
+pub fn commandLineInputRight(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
+    self.line_input_cursor = @min(self.line_input_cursor + 1, self.line_input_buffer.items.len);
+}
+
+pub fn commandLineInputDeleteWordForward(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
+    const start_index = self.line_input_cursor;
+    var end_index = start_index;
+    var has_done_alpha = false;
+    while (end_index < self.line_input_buffer.items.len) : (end_index += 1) {
+        switch (self.line_input_buffer.items[end_index]) {
+            ' ', '\t', '\r', '\n' => {
+                if (has_done_alpha) break;
+            },
+            'a'...'z', 'A'...'Z', '0'...'9', '_' => {
+                has_done_alpha = true;
+            },
+            else => break,
+        }
+    }
+
+    self.line_input_buffer.replaceRange(self.allocator, start_index, end_index - start_index, "") catch @panic("OOM");
+}
+
+pub fn commandLineInputDeleteWordBackward(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
+    var start_index = self.line_input_cursor -| 1;
+    const end_index = self.line_input_cursor;
+
+    const starts_with_invalid_char = if (self.line_input_buffer.items.len > 0)
+        switch (self.line_input_buffer.items[start_index]) {
+            ' ', '\t', '\r', '\n' => false,
+            'a'...'z', 'A'...'Z', '0'...'9', '_' => false,
+            else => true,
+        }
+    else
+        false;
+
+    var has_done_alpha = false;
+    while (start_index > 0) : (start_index -= 1) {
+        switch (self.line_input_buffer.items[start_index]) {
+            ' ', '\t', '\r', '\n' => {
+                if (has_done_alpha) {
+                    start_index += 1;
+                    break;
+                }
+            },
+            'a'...'z', 'A'...'Z', '0'...'9', '_' => {
+                has_done_alpha = true;
+            },
+            else => {
+                if (!starts_with_invalid_char) {
+                    start_index += 1;
+                }
+                break;
+            },
+        }
+    }
+
+    self.line_input_cursor = start_index;
+    self.line_input_buffer.replaceRange(self.allocator, start_index, end_index - start_index, "") catch @panic("OOM");
+}
+
+pub fn commandLineInputGoBackWord(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
+    var index = self.line_input_cursor -| 1;
+    var has_done_alpha = false;
+
+    const starts_with_invalid_char = if (self.line_input_buffer.items.len > 0)
+        switch (self.line_input_buffer.items[index]) {
+            ' ', '\t', '\r', '\n' => false,
+            'a'...'z', 'A'...'Z', '0'...'9', '_' => false,
+            else => true,
+        }
+    else
+        false;
+
+    while (index > 0) : (index -= 1) {
+        switch (self.line_input_buffer.items[index]) {
+            ' ', '\t', '\r', '\n' => {
+                if (has_done_alpha) {
+                    index += 1;
+                    break;
+                }
+            },
+            'a'...'z', 'A'...'Z', '0'...'9', '_' => {
+                has_done_alpha = true;
+            },
+            else => {
+                if (!starts_with_invalid_char) {
+                    index += 1;
+                }
+                break;
+            },
+        }
+    }
+
+    self.line_input_cursor = @min(index, self.line_input_buffer.items.len);
+}
+
+pub fn commandLineInputGoForwardWord(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
+    var index = self.line_input_cursor;
+    var has_done_alpha = false;
+    while (index < self.line_input_buffer.items.len) : (index += 1) {
+        switch (self.line_input_buffer.items[index]) {
+            ' ', '\t', '\r', '\n' => {
+                if (has_done_alpha) {
+                    break;
+                }
+            },
+            'a'...'z', 'A'...'Z', '0'...'9', '_' => {
+                has_done_alpha = true;
+            },
+            else => {
+                index += 1;
+                break;
+            },
+        }
+    }
+
+    self.line_input_cursor = @min(index, self.line_input_buffer.items.len);
+}
+
 // ********************* NORMAL COMMANDS *********************
+
+pub fn commandEnterSearchMode(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
+    self.mode = .search;
+    self.line_input_buffer.items.len = 0;
+    self.line_input_cursor = 0;
+}
+
+pub fn commandEnterCommandMode(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
+    self.mode = .command;
+    self.line_input_buffer.items.len = 0;
+    self.line_input_cursor = 0;
+}
 
 pub fn commandEnterInsertMode(self: *Self, dispatch: *DispatchState) void {
     _ = dispatch;
@@ -1311,7 +1562,6 @@ fn textObjectCommon(self: *Self, dispatch: *DispatchState, movement: Movement) v
         },
         else => unreachable,
     }
-
 }
 
 pub fn commandVisualTextObjectInner(self: *Self, dispatch: *DispatchState) void {
@@ -1707,6 +1957,8 @@ pub fn render(self: *Self, area: ed.Rect, renderer: *ed.Renderer) void {
                     .normal => .block,
                     .visual => .block,
                     .visual_line => .block,
+                    .search => .underline,
+                    .command => .underline,
                 };
                 renderer.set_cursor_style(.init(0xff, 0xdd, 0x33), bg_color);
             } else if (self.view.cursor.containsPosition(current_char_offset)) {
@@ -1751,36 +2003,84 @@ pub fn render(self: *Self, area: ed.Rect, renderer: *ed.Renderer) void {
             }
         }
 
-        // const cursor_coord = current_document.rope.lineColumnFromRelativePosition(self.view.start_position, self.view.cursor_position);
-        if (true) {
-            const mode_display = switch (self.mode) {
-                .insert => .{ "INSERT", ed.Color.red, ed.UnderlineStyle.none },
-                .normal => .{ "NORMAL", ed.Color.green, ed.UnderlineStyle.none },
-                .visual => .{ "VISUAL", ed.Color.init(255, 0, 255), ed.UnderlineStyle.none },
-                .visual_line => .{ " LINE ", ed.Color.init(0, 200, 255), ed.UnderlineStyle.line },
-            };
+        var number_buf: [16]u8 = undefined;
+        const number = std.fmt.bufPrint(&number_buf, "{:6}", .{self.view.cursor.head}) catch @panic("buffer to small!");
+        const number_x_coord = @as(u16, @truncate(area.right)) - @as(u16, @truncate(number.len)) - 2;
+        const status_x_coord: u16 = @truncate(area.left);
+        y = @truncate(area.bottom - 2);
 
-            x = @truncate(area.left);
-            y = @truncate(area.bottom - 2);
-            for (mode_display[0]) |c| {
-                if (c == ' ') {
-                    renderer.place_glyph(x, y, &.{@as(u16, c)}, .init(0, 0, 0), mode_display[1], .init(0, 0, 0), .none, .hidden);
-                } else {
-                    renderer.place_glyph(x, y, &.{@as(u16, c)}, .init(0, 0, 0), mode_display[1], .init(0, 0, 0), mode_display[2], .hidden);
+        switch (self.mode) {
+            .search, .command => {
+                x = status_x_coord;
+                const bg_color = ed.Color.init(35, 35, 50);
+
+                const line_input_view_len = number_x_coord - status_x_coord - 2;
+                if (self.line_input_cursor >= self.line_input_view_start + line_input_view_len) {
+                    self.line_input_view_start += 1;
+                } else if (self.line_input_cursor < self.line_input_view_start) {
+                    self.line_input_view_start -|= 1;
                 }
-                x += 1;
-            }
+                const start_index: usize = self.line_input_view_start;
+                const end_index: usize = @min(start_index + line_input_view_len, self.line_input_buffer.items.len);
 
-            var number_buf: [16]u8 = undefined;
-            const number = std.fmt.bufPrint(&number_buf, "{:6}", .{self.view.cursor.head}) catch @panic("buffer to small!");
-            x = @as(u16, @truncate(area.right)) - @as(u16, @truncate(number.len)) - 2;
+                const utf8_view = std.unicode.Utf8View.init(self.line_input_buffer.items[start_index..end_index]) catch @panic("Invalid utf8");
+                var utf8_iter = utf8_view.iterator();
 
-            for (number) |c| {
-                renderer.place_glyph(x, y, &.{@as(u16, c)}, .white, .init(20, 20, 20), .init(0, 0, 0), .none, .hidden);
+                const char: u8 = switch (self.mode) {
+                    .search => '/',
+                    .command => ':',
+                    else => unreachable,
+                };
+                renderer.place_glyph(x, y, &.{char}, .white, bg_color, .init(0, 0, 0), .none, .hidden);
                 x += 1;
-            }
-            renderer.place_glyph(x, y, &.{' '}, .white, .init(20, 20, 20), .init(0, 0, 0), .none, .hidden);
+
+                var index: usize = start_index;
+                while (utf8_iter.nextCodepoint()) |codepoint| {
+                    const cursor_kind = if (index == self.line_input_cursor)
+                        ed.CursorKind.bar
+                    else
+                        .hidden;
+                    renderer.place_glyph(x, y, &.{@truncate(codepoint)}, .white, bg_color, .init(0, 0, 0), .none, cursor_kind);
+                    index += 1;
+                    x += 1;
+                }
+
+                if (index == self.line_input_cursor) {
+                    renderer.place_glyph(x, y, &.{' '}, .white, bg_color, .init(0, 0, 0), .none, .bar);
+                    x += 1;
+                }
+
+                while (x < number_x_coord) : (x += 1) {
+                    renderer.place_glyph(x, y, &.{@as(u16, ' ')}, .white, bg_color, .init(0, 0, 0), .none, .hidden);
+                }
+            },
+            else => {
+                const mode_display = switch (self.mode) {
+                    .insert => .{ "INSERT", ed.Color.red, ed.UnderlineStyle.none },
+                    .normal => .{ "NORMAL", ed.Color.green, ed.UnderlineStyle.none },
+                    .visual => .{ "VISUAL", ed.Color.init(255, 0, 255), ed.UnderlineStyle.none },
+                    .visual_line => .{ " LINE ", ed.Color.init(0, 200, 255), ed.UnderlineStyle.line },
+                    else => unreachable,
+                };
+
+                x = status_x_coord;
+                for (mode_display[0]) |c| {
+                    if (c == ' ') {
+                        renderer.place_glyph(x, y, &.{@as(u16, c)}, .init(0, 0, 0), mode_display[1], .init(0, 0, 0), .none, .hidden);
+                    } else {
+                        renderer.place_glyph(x, y, &.{@as(u16, c)}, .init(0, 0, 0), mode_display[1], .init(0, 0, 0), mode_display[2], .hidden);
+                    }
+                    x += 1;
+                }
+            },
         }
+
+        x = number_x_coord;
+        for (number) |c| {
+            renderer.place_glyph(x, y, &.{@as(u16, c)}, .white, .init(20, 20, 20), .init(0, 0, 0), .none, .hidden);
+            x += 1;
+        }
+        renderer.place_glyph(x, y, &.{' '}, .white, .init(20, 20, 20), .init(0, 0, 0), .none, .hidden);
     }
 }
 
@@ -1905,7 +2205,7 @@ test "Editor - Delete Motion" {
     try editor.testMotion(&.{ .{ .char = 'f' }, .{ .char = 'c' } }, 15, 15);
 }
 
-test "Editor - Delete TextObject" {
+test "Editor - Delete TextObject Inner" {
     var testapp = TestApp.create("test/test_textobject", @src());
     defer testapp.deinit();
     const editor = testapp.editor;
@@ -1948,6 +2248,45 @@ test "Editor - Delete TextObject" {
     try editor.testMotionLC(&.{ .{ .char = 'f' }, .{ .char = ')' } }, 6, 30);
     try editor.testMotionLC(&.{ .{ .char = 'd' }, .{ .char = 'i' }, .{ .char = '(' } }, 6, 4);
     try editor.testMotionLC(&.{ .{ .char = 'd' }, .{ .char = 'i' }, .{ .char = ')' } }, 6, 4);
+}
+
+test "Editor - Delete TextObject Outer" {
+    var testapp = TestApp.create("test/test_textobject", @src());
+    defer testapp.deinit();
+    const editor = testapp.editor;
+
+    // Pretty much same as TextObject Inner
+    editor.applyEvents(&.{ .{ .char = 'f' }, .{ .char = 'a' } });
+    try editor.testMotionLC(&.{ .{ .char = 'd' }, .{ .char = 'a' }, .{ .char = '(' } }, 0, 8);
+    try editor.testMotionLC(&.{ .{ .char = 'f' }, .{ .char = '-' } }, 0, 9);
+
+    editor.applyEvents(&.{ .{ .char = 'f' }, .{ .char = '~' } });
+    try editor.testMotionLC(&.{ .{ .char = 'f' }, .{ .char = '(' } }, 1, 8);
+    try editor.testMotionLC(&.{ .{ .char = 'd' }, .{ .char = 'a' }, .{ .char = '(' } }, 1, 8);
+    try editor.testMotionLC(&.{ .{ .char = 'f' }, .{ .char = '-' } }, 1, 9);
+
+    editor.applyEvents(&.{ .{ .char = 'f' }, .{ .char = '~' } });
+    editor.applyEvents(&.{ .{ .char = 'f' }, .{ .char = '*' } });
+    try editor.testMotionLC(&.{ .{ .char = 'd' }, .{ .char = 'a' }, .{ .char = '(' } }, 2, 8);
+    try editor.testMotionLC(&.{ .{ .char = 'f' }, .{ .char = '-' } }, 2, 9);
+
+    try editor.testMotionLC(&.{ .{ .char = 'f' }, .{ .char = ')' } }, 3, 22);
+    try editor.testMotionLC(&.{ .{ .char = 'd' }, .{ .char = 'a' }, .{ .char = '(' } }, 3, 8);
+    try editor.testMotionLC(&.{ .{ .char = 'f' }, .{ .char = '-' } }, 3, 9);
+
+    editor.applyEvents(&.{ .{ .char = 'f' }, .{ .char = '~' } });
+    try editor.testMotionLC(&.{ .{ .char = 'd' }, .{ .char = 'a' }, .{ .char = '(' } }, 4, 3);
+    try editor.testMotionLC(&.{ .{ .char = 'f' }, .{ .char = '-' } }, 4, 4);
+
+    editor.applyEvents(&.{ .{ .char = 'f' }, .{ .char = '~' } });
+    editor.applyEvents(&.{ .{ .char = 'f' }, .{ .char = 'b' } });
+    try editor.testMotionLC(&.{ .{ .char = 'd' }, .{ .char = 'a' }, .{ .char = '(' } }, 5, 3);
+    try editor.testMotionLC(&.{ .{ .char = 'f' }, .{ .char = '-' } }, 5, 4);
+
+    editor.applyEvents(&.{ .{ .char = 'f' }, .{ .char = '~' } });
+    try editor.testMotionLC(&.{ .{ .char = 'f' }, .{ .char = ')' } }, 6, 26);
+    try editor.testMotionLC(&.{ .{ .char = 'f' }, .{ .char = ')' } }, 6, 30);
+    try editor.testMotionLC(&.{ .{ .char = 'd' }, .{ .char = 'a' }, .{ .char = ')' } }, 6, 3);
 }
 
 test "Editor - Visual Motion" {
@@ -1997,4 +2336,24 @@ test "Editor - Visual Text Objects" {
     try editor.testMotionLCSplit(&.{ .{ .char = 'v' }, .{ .char = 'i' }, .{ .char = '{' } }, 9, 0, 9, 9);
     try editor.testMotionLC(&.{.{ .key = .escape }}, 9, 9);
     try editor.testMotionLCSplit(&.{ .{ .char = 'v' }, .{ .char = 'i' }, .{ .char = '{' } }, 9, 0, 9, 9);
+}
+
+test "Editor - Visual Text Objects Outer" {
+    var testapp = TestApp.create("test/test_textobject", @src());
+    defer testapp.deinit();
+    const editor = testapp.editor;
+
+    editor.applyEvents(&.{ .{ .char = 'f' }, .{ .char = 'a' } });
+    try editor.testMotionLCSplit(&.{ .{ .char = 'v' }, .{ .char = 'a' }, .{ .char = '(' } }, 0, 8, 0, 22);
+    try editor.testMotionLCSplit(&.{ .{ .char = 'a' }, .{ .char = '(' } }, 0, 8, 0, 22);
+    try editor.testMotionLC(&.{.{ .key = .escape }}, 0, 22);
+    editor.applyEvents(&.{ .{ .char = 'v' }, .{ .char = 'h' } });
+    try editor.testMotionLCSplit(&.{ .{ .char = 'a' }, .{ .char = '(' } }, 0, 22, 0, 8);
+    try editor.testMotionLCSplit(&.{ .{ .char = 'a' }, .{ .char = '(' } }, 0, 22, 0, 8);
+    try editor.testMotionLC(&.{.{ .key = .escape }}, 0, 8);
+
+    try editor.testMotionLC(&.{ .{ .char = '0' }, .{ .char = 'j' }, .{ .char = 'j' }, .{ .char = 'j' }, .{ .char = 'j' }, .{ .char = 'j' }, .{ .char = 'j' }, .{ .char = 'j' }, .{ .char = 'j' } }, 8, 0);
+    try editor.testMotionLCSplit(&.{ .{ .char = 'v' }, .{ .char = 'a' }, .{ .char = '{' } }, 8, 3, 10, 0);
+    try editor.testMotionLC(&.{.{ .key = .escape }}, 10, 0);
+    try editor.testMotionLCSplit(&.{ .{ .char = 'v' }, .{ .char = 'a' }, .{ .char = '{' } }, 8, 3, 10, 0);
 }

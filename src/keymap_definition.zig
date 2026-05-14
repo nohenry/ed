@@ -4,6 +4,16 @@ const shift: u32 = 300000;
 const movement: u32 = 400000;
 const character: u32 = 500000;
 
+pub const line_input_keymap_definition = .{
+    .{ .{ ctrl, 'a' }, "commandLineInputStartOfLine" },
+    .{ .{ ctrl, 'e' }, "commandLineInputEndOfLine" },
+    .{ .{ ctrl, 'b' }, "commandLineInputLeft" },
+    .{ .{ ctrl, 'f' }, "commandLineInputRight" },
+    .{ .{ alt, 'd' }, "commandLineInputDeleteWordForward" },
+    .{ .{ alt, 'b' }, "commandLineInputGoBackWord" },
+    .{ .{ alt, 'f' }, "commandLineInputGoForwardWord" },
+};
+
 pub const normal_keymap_definition = .{
     .{ 'i', "commandEnterInsertMode" },
     .{ 'a', "commandEnterInsertModeAppend" },
@@ -30,12 +40,14 @@ pub const normal_keymap_definition = .{
     .{ .{ ctrl, 'u' }, "commandMoveUpHalfView" },
     .{ .{ ctrl, 'd' }, "commandMoveDownHalfView" },
 
-
     .{ '>', "commandIndentIn" },
     .{ '<', "commandIndentOut" },
 
     .{ 'n', "commandVisualSearchNext" },
     .{ 'N', "commandVisualSearchPrev" },
+
+    .{ '/', "commandEnterSearchMode" },
+    .{ ':', "commandEnterCommandMode" },
 
     .{ movement, "commandMove" },
 };

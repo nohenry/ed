@@ -14,6 +14,7 @@ pub fn main(init: std.process.Init) !void {
     _ = try writer.interface.write("pub const DispatchResult = enum { not_mapped, waiting, dispatched_command };\n");
     _ = try writer.interface.write("pub fn DispatchState(comptime Movement: type) type { return struct { state: usize = 0, characters: [4]u32 = [4]u32{0,0,0,0}, character_count: usize = 0, movement: ?Movement = null, pub fn chars(self: *const @This()) []const u32 { return self.characters[0..self.character_count]; } }; }\n");
 
+    try generate(&writer.interface, "dispatchLineInputCommand", @import("keymap_definition.zig").line_input_keymap_definition);
     try generate(&writer.interface, "dispatchNormalCommand", @import("keymap_definition.zig").normal_keymap_definition);
     try generate(&writer.interface, "dispatchVisualCommand", @import("keymap_definition.zig").visual_keymap_definition);
 }
