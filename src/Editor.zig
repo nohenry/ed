@@ -2,6 +2,7 @@ const std = @import("std");
 const ed = @import("ed.zig");
 const keymap = @import("keymap");
 const config = @import("config.zig");
+const lang = @import("language.zig");
 
 comptime {
     _ = keymap;
@@ -35,6 +36,8 @@ registers: Registers = .{},
 last_yanked_range: ?ed.View.Range = null,
 
 saved_insert_node: ?*ed.Rope.Node = null,
+saved_backspace_node: ?*ed.Rope.Node = null,
+saved_delete_node: ?*ed.Rope.Node = null,
 
 key_dispatch_state: DispatchState = .{},
 
@@ -186,6 +189,8 @@ pub fn handleInsertModeKeydown(self: *Self, event: ed.Event) void {
     const data = event.key_down;
     switch (data.key) {
         .char => {
+            self.saved_backspace_node = null;
+            self.saved_delete_node = null;
             const node = self.saved_insert_node orelse blk: {
                 const new_node = document.rope.insertString(self.view.cursor.head, "");
                 self.saved_insert_node = new_node;
@@ -200,7 +205,39 @@ pub fn handleInsertModeKeydown(self: *Self, event: ed.Event) void {
             self.view.cursor.tail += utf8_len;
             self.view.max_column += utf8_len;
         },
+        .delete => {
+            if (self.view.cursor.head < document.rope.len) {
+                self.saved_insert_node = null;
+                if (self.saved_delete_node) |delete_node| {
+                    _ = delete_node;
+                    std.debug.print("using delet node\n", .{});
+                    _, _, _, _ = document.rope.deleteRange(self.view.cursor.head, self.view.cursor.head + 1).?;
+                } else {
+                    const new_saved, _, _, const new_saved_rhs = document.rope.deleteRange(self.view.cursor.head, self.view.cursor.head + 1).?;
+                    self.saved_backspace_node = new_saved;
+                    self.saved_delete_node = new_saved_rhs;
+                }
+            }
+        },
+        .backspace => {
+            if (self.view.cursor.head > 0) {
+                self.saved_insert_node = null;
+                // deleteRange is kinda expensive, so we save the split node, the reuse that node and decrement it's
+                // length if we just spam the backspace key
+                if (self.saved_backspace_node) |backspace_node| {
+                    std.debug.print("using backspace node\n", .{});
+                    self.saved_backspace_node = document.rope.backspaceOneWithNode(backspace_node);
+                } else {
+                    const new_saved, _, _, const new_saved_rhs = document.rope.deleteRange(self.view.cursor.head - 1, self.view.cursor.head).?;
+                    self.saved_backspace_node = new_saved;
+                    self.saved_delete_node = new_saved_rhs;
+                }
+                self.view.cursor.head -= 1;
+            }
+        },
         .escape => {
+            self.saved_backspace_node = null;
+            self.saved_delete_node = null;
             self.key_dispatch_state = .{};
             self.mode = .normal;
             self.saved_insert_node = null;
@@ -1991,7 +2028,13 @@ pub fn render(self: *Self, area: ed.Rect, renderer: *ed.Renderer) void {
         var current_match: ?ed.View.Selection = if (self.matcher != null) matcher.?.next() else null;
         var current_match_is_dirty = false;
 
-        const bg_color_ = ed.Color.init(40, 40, 60);
+        var syntax_highlighter = ed.SyntaxHighlighter.init(lang.Tokenizer.initStartingFrom(&current_document.rope, self.view.start_position));
+        var keyword_buffer = std.ArrayList(u8).empty;
+        var current_token: ?struct { lang.Token, ed.Color } = syntax_highlighter.nextHighlight(&current_document.rope, &keyword_buffer, self.scratch.allocator());
+        var current_token_is_dirty = false;
+
+        const fg_color_ = ed.SyntaxHighlighter.Highlight.white;
+        const bg_color_ = ed.SyntaxHighlighter.Highlight.black;
         var current_char_offset: usize = self.view.start_position;
 
         var x: u16 = @truncate(area.left);
@@ -2014,7 +2057,7 @@ pub fn render(self: *Self, area: ed.Rect, renderer: *ed.Renderer) void {
             }
             if (y >= @as(u16, @truncate(area.bottom))) break;
 
-            var fg_color = ed.Color.white;
+            var fg_color = fg_color_;
             var bg_color = bg_color_;
 
             var cursor_kind: ed.CursorKind = .hidden;
@@ -2031,7 +2074,19 @@ pub fn render(self: *Self, area: ed.Rect, renderer: *ed.Renderer) void {
                 renderer.set_cursor_style(.init(0xff, 0xdd, 0x33), bg_color);
             }
 
-            // --------- Background Highlighting ---------
+            // --------- Begin Highlighting ---------
+            if (current_token) |tok| {
+                if (current_char_offset >= tok[0].loc.start and current_char_offset < tok[0].loc.end) {
+                    current_token_is_dirty = true;
+                    if (cursor_kind != .block) {
+                        fg_color = tok[1];
+                    }
+                }
+                if (current_char_offset + 1 >= tok[0].loc.end) {
+                    current_token = syntax_highlighter.nextHighlight(&current_document.rope, &keyword_buffer, self.scratch.allocator());
+                    current_token_is_dirty = false;
+                }
+            }
             if (current_match) |match| {
                 if (match.containsPosition(current_char_offset)) {
                     current_match_is_dirty = true;
@@ -2054,6 +2109,7 @@ pub fn render(self: *Self, area: ed.Rect, renderer: *ed.Renderer) void {
                     bg_color = .green;
                 }
             }
+            // --------- End Highlighting ---------
 
             if (codepoint.len == 1) {
                 switch (codepoint[0]) {
@@ -2079,6 +2135,8 @@ pub fn render(self: *Self, area: ed.Rect, renderer: *ed.Renderer) void {
                     },
                 }
             }
+        } else {
+            std.debug.print("did not break\n", .{});
         }
 
         while (y < @as(u16, @truncate(area.bottom))) : (y += 1) {

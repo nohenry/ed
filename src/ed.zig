@@ -1,15 +1,18 @@
+const std = @import("std");
 pub const Document = @import("Document.zig");
 pub const View = @import("View.zig");
 pub const Rope = @import("Rope.zig");
 pub const Editor = @import("Editor.zig");
 pub const Pattern = @import("pattern.zig").Pattern;
 pub const Application = @import("Application.zig");
+pub const SyntaxHighlighter = @import("SyntaxHighlighter.zig");
 
 pub const Renderer = @import("directx/directx.zig").Renderer;
 
 comptime {
     _ = Rope;
     _ = Editor;
+    _ = SyntaxHighlighter;
 }
 
 pub const TextObject = enum {
@@ -211,6 +214,43 @@ pub const Color = extern struct {
 
     pub fn init(r: u8, g: u8, b: u8) Color {
         return .{ .r = r, .g = g, .b = b, .a = 255 };
+    }
+
+    pub fn initHex(comptime hex: []const u8) Color {
+        var str = hex;
+        if (str.len > 0 and str[0] == '#') {
+            str = str[1..];
+        }
+        if (str.len == 3) {
+            const r = parseHexDigit(str[0]) orelse @panic("Invalid hex digit");
+            const g = parseHexDigit(str[1]) orelse @panic("Invalid hex digit");
+            const b = parseHexDigit(str[2]) orelse @panic("Invalid hex digit");
+            return .{ .r = r + r * 16, .g = g + g * 16, .b = b + b * 16, .a = 255 };
+        } else if (str.len == 6) {
+            const r_hi = parseHexDigit(str[0]) orelse @panic("Invalid hex digit");
+            const r_lo = parseHexDigit(str[1]) orelse @panic("Invalid hex digit");
+            const g_hi = parseHexDigit(str[2]) orelse @panic("Invalid hex digit");
+            const g_lo = parseHexDigit(str[3]) orelse @panic("Invalid hex digit");
+            const b_hi = parseHexDigit(str[4]) orelse @panic("Invalid hex digit");
+            const b_lo = parseHexDigit(str[5]) orelse @panic("Invalid hex digit");
+            return .{
+                .r = r_lo + r_hi * 16,
+                .g = g_lo + g_hi * 16,
+                .b = b_lo + b_hi * 16,
+                .a = 255,
+            };
+        } else {
+            @panic("Invalid hex literal");
+        }
+    }
+
+    fn parseHexDigit(digit: u8) ?u8 {
+        return switch (digit) {
+            '0'...'9' => digit - '0',
+            'a'...'f' => digit - 'a' + 0xa,
+            'A'...'F' => digit - 'A' + 0xa,
+            else => null,
+        };
     }
 
     pub fn toPacked(self: Color) u32 {

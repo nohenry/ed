@@ -1565,6 +1565,7 @@ fn prependString(self: *Self, string: Node.String) *Node {
     if (parent) |p| {
         if (p.left) |left| {
             const new_parent = self.createNode(new_left, left);
+            new_parent.parent = p;
             p.left = new_parent;
         } else {
             p.left = new_left;
@@ -1590,6 +1591,7 @@ fn appendString(self: *Self, string: Node.String) *Node {
     if (parent) |p| {
         if (p.right) |right| {
             const new_parent = self.createNode(right, new_right);
+            new_parent.parent = p;
             p.right = new_parent;
         } else {
             p.right = new_right;
@@ -1604,18 +1606,14 @@ fn appendString(self: *Self, string: Node.String) *Node {
 }
 
 /// start is inclusive, end is exclusive
-pub fn deleteRange(self: *Self, start: usize, end: usize) ?struct { *Node, *Node, *Node } {
+/// returns lhs existing node, lhs deleted node, rhs deleted node, rhs existing node
+pub fn deleteRange(self: *Self, start: usize, end: usize) ?struct { *Node, *Node, *Node, *Node } {
     if (self.root == null) return null;
     const lhs = self.split(self.root.?, start);
     const rhs = self.split(lhs[1], end - start);
 
     lhs[1].parent = null;
     rhs[0].parent = null;
-    var iter_ = self.nodeIterNode(lhs[1]);
-
-    while (iter_.next()) |leaf| {
-        std.debug.print("leaf: '{s}'\n", .{leaf.string.items});
-    }
 
     self.recycleNodes(rhs[0], true);
 
@@ -1624,9 +1622,34 @@ pub fn deleteRange(self: *Self, start: usize, end: usize) ?struct { *Node, *Node
     while (!current.isLeaf()) {
         current = current.left.?;
     }
+    const rhs_existing = current;
+
+    current = lhs[0];
+    while (!current.isLeaf()) {
+        current = current.right.?;
+    }
+    const lhs_existing = current;
 
     self.len -= end - start;
-    return .{ lhs[1], rhs[0], current };
+    return .{ lhs_existing, lhs[1], rhs[0], rhs_existing };
+}
+
+/// Deletes one character backward
+pub fn backspaceOneWithNode(self: *Self, node: *Node) ?*Node {
+    var result = node;
+    while (result.string.items.len == 0) {
+        result = result.previousLeaf() orelse return null;
+    }
+
+    var current: ?*Node = result;
+    while (current != null) {
+        current.?.total_length -= 1;
+        current = current.?.parent;
+    }
+
+    result.string.items.len -= 1;
+    self.len -= 1;
+    return result;
 }
 
 pub fn recycleNodes(self: *Self, root: *Node, comptime include_leafs: bool) void {
@@ -1949,6 +1972,17 @@ pub fn toOwnedSlice(self: *Self, start: usize, end: usize, allocator: std.mem.Al
         buffer.writer.writeAll(slice) catch @panic("OOM");
     }
     return buffer.writer.buffer;
+}
+
+pub fn toOwnedSliceArrayList(self: *Self, start: usize, end: usize, list: *std.ArrayList(u8), allocator: std.mem.Allocator) void {
+    list.items.len = 0;
+    list.ensureTotalCapacity(allocator, end - start) catch @panic("OOM");
+    var buffer = std.Io.Writer.Allocating.fromArrayList(allocator, list);
+    var range_iter = self.rangeIter(start, end);
+    while (range_iter.next()) |slice| {
+        buffer.writer.writeAll(slice) catch @panic("OOM");
+    }
+    list.* = buffer.toArrayList();
 }
 
 /// Returns the node, and the relative string offset into the node

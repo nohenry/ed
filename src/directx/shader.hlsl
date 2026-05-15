@@ -39,7 +39,7 @@ uint2 UnpackGlyphXY(uint glyph_index)
 float4 ComputeOutputColor(uint2 ScreenPos)
 {
     if (ScreenPos.x < 4 || ScreenPos.y < 4) {
-        return float4(0.157, 0.157, 0.235, 1.0);
+        return float4(0.157, 0.173, 0.204, 1.0);
     }
     ScreenPos -= uint2(4, 4);
     uint2 CellIndex = ScreenPos / cell_size;

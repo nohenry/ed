@@ -14,6 +14,7 @@ pub fn main(init: std.process.Init) !void {
     defer application.deinit();
 
     // application.createEditor(init.io, "test/test_textobject");
+    //application.createEditor(init.io, "test/test2");
     application.createEditor(init.io, "build.zig");
     application.run();
 }
