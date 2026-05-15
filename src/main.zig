@@ -13,7 +13,8 @@ pub fn main(init: std.process.Init) !void {
     application.initPinned(init.io, init.gpa, "MyEditor", false);
     defer application.deinit();
 
-    application.createEditor(init.io, "test/test_textobject");
+    // application.createEditor(init.io, "test/test_textobject");
+    application.createEditor(init.io, "build.zig");
     application.run();
 }
 

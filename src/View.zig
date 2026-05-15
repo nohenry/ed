@@ -26,7 +26,7 @@ pub const Selection = struct {
     tail: usize = 0,
 
     pub inline fn containsPosition(self: @This(), position: usize) bool {
-        return (position >= self.tail and position < self.head) or (position >= self.head and position <= self.tail);
+        return (position >= self.tail and position <= self.head) or (position >= self.head and position <= self.tail);
     }
 
     pub inline fn getOrdered(self: @This()) struct { usize, usize } {

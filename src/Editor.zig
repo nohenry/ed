@@ -27,6 +27,7 @@ mode: enum {
     visual,
     visual_line,
     search,
+    search_pattern,
     command,
 } = .normal,
 
@@ -38,6 +39,8 @@ saved_insert_node: ?*ed.Rope.Node = null,
 key_dispatch_state: DispatchState = .{},
 
 matcher: ?ed.Rope.Matcher = null,
+pattern_arena: std.heap.ArenaAllocator,
+search_saved_view: ?ed.View = null,
 
 last_find: ?u32 = null,
 last_find_kind: ToTill = .to,
@@ -75,6 +78,7 @@ pub fn init(application: *anyopaque, application_vtable: *const ApplicationVtabl
         .application_vtable = application_vtable,
         .io = io,
         .allocator = allocator,
+        .pattern_arena = .init(std.heap.page_allocator),
         .scratch = .init(std.heap.page_allocator),
     };
 }
@@ -162,8 +166,7 @@ pub fn handleEvent(self: *Self, event: ed.Event) void {
                 .insert => self.handleInsertModeKeydown(event),
                 .normal => self.handleNormalModeKeydown(event),
                 .visual, .visual_line => self.handleVisualModeKeydown(event),
-                .search => self.handleSearchKeydown(event),
-                .command => self.handleCommandKeydown(event),
+                .search, .search_pattern, .command => self.handleLineInputKeydown(event),
             }
         },
         .timer => |timer_id| {
@@ -261,7 +264,7 @@ pub fn handleVisualModeKeydown(self: *Self, event: ed.Event) void {
     }
 }
 
-pub fn handleSearchKeydown(self: *Self, event: ed.Event) void {
+pub fn handleLineInputKeydown(self: *Self, event: ed.Event) void {
     const data = event.key_down;
 
     switch (data.key) {
@@ -274,9 +277,25 @@ pub fn handleSearchKeydown(self: *Self, event: ed.Event) void {
                     if (std.ascii.isPrint(ch)) {
                         self.line_input_buffer.insert(self.allocator, self.line_input_cursor, ch) catch @panic("OOM");
                         self.line_input_cursor += 1;
+                        switch (self.mode) {
+                            .search => self.handleSearchModified(),
+                            .search_pattern => self.handleSearchPatternModified(),
+                            .command => self.handleComandModified(),
+                            else => unreachable,
+                        }
                     }
                 }
             }
+        },
+        .enter => {
+            switch (self.mode) {
+                .search, .search_pattern => {
+                    self.search_saved_view = null;
+                },
+                .command => {},
+                else => unreachable,
+            }
+            self.mode = .normal;
         },
         .left => {
             self.line_input_cursor -|= 1;
@@ -293,54 +312,72 @@ pub fn handleSearchKeydown(self: *Self, event: ed.Event) void {
                     _ = self.line_input_buffer.orderedRemove(self.line_input_cursor - 1);
                     self.line_input_cursor -= 1;
                 }
+
+                switch (self.mode) {
+                    .search => self.handleSearchModified(),
+                    .search_pattern => self.handleSearchPatternModified(),
+                    .command => self.handleComandModified(),
+                    else => unreachable,
+                }
             }
         },
         .escape => {
+            switch (self.mode) {
+                .search, .search_pattern => {
+                    if (self.search_saved_view) |v| self.view = v;
+                    self.search_saved_view = null;
+                },
+                .command => {},
+                else => unreachable,
+            }
             self.mode = .normal;
         },
         else => {},
     }
 }
 
-pub fn handleCommandKeydown(self: *Self, event: ed.Event) void {
-    const data = event.key_down;
+pub fn handleSearchModified(self: *Self) void {
+    const document = self.documents.getPtr(self.current_document) orelse return;
 
-    switch (data.key) {
-        .char => {
-            if ((data.char & 0x7F) == data.char) {
-                const key_result = keymap.dispatchLineInputCommand(&self.key_dispatch_state, (@as(u16, @as(u3, @bitCast(data.modifers))) << 7) | @as(u7, @truncate(data.char)), self);
-
-                if (key_result == .not_mapped) {
-                    const ch: u8 = @truncate(data.char & 0x7F);
-                    if (std.ascii.isPrint(ch)) {
-                        self.line_input_buffer.insert(self.allocator, self.line_input_cursor, ch) catch @panic("OOM");
-                        self.line_input_cursor += 1;
-                    }
-                }
-            }
-        },
-        .left => {
-            self.line_input_cursor -|= 1;
-        },
-        .right => {
-            self.line_input_cursor = @min(self.line_input_cursor + 1, self.line_input_buffer.items.len);
-        },
-        .backspace => {
-            if (self.line_input_cursor > 0) {
-                if (data.modifers.alt > 0) {
-                    var dispatch = keymap.DispatchState(Movement){};
-                    self.commandLineInputDeleteWordBackward(&dispatch);
-                } else {
-                    _ = self.line_input_buffer.orderedRemove(self.line_input_cursor - 1);
-                    self.line_input_cursor -= 1;
-                }
-            }
-        },
-        .escape => {
-            self.mode = .normal;
-        },
-        else => {},
+    if (self.search_saved_view == null) {
+        self.search_saved_view = self.view;
     }
+    _ = self.pattern_arena.reset(.retain_capacity);
+    const pattern = ed.Pattern.parseLiteral(self.line_input_buffer.items, self.pattern_arena.allocator());
+
+    const cursor = self.search_saved_view.?.cursor;
+    self.matcher = document.rope.matchStartingFrom(pattern, cursor.getOrdered()[1]);
+
+    const match_opt = self.matcher.?.next();
+    if (match_opt) |match| {
+        self.adjustViewToCursorPosition(match.getOrdered()[0]);
+        self.setCursor(match.tail);
+        self.calculateMaxColumn(match.tail);
+    }
+}
+
+pub fn handleSearchPatternModified(self: *Self) void {
+    const document = self.documents.getPtr(self.current_document) orelse return;
+
+    if (self.search_saved_view == null) {
+        self.search_saved_view = self.view;
+    }
+    _ = self.pattern_arena.reset(.retain_capacity);
+    const pattern = ed.Pattern.parseTokenBased(self.line_input_buffer.items, self.pattern_arena.allocator());
+
+    const cursor = self.search_saved_view.?.cursor;
+    self.matcher = document.rope.matchStartingFrom(pattern, cursor.getOrdered()[1]);
+
+    const match_opt = self.matcher.?.next();
+    if (match_opt) |match| {
+        self.adjustViewToCursorPosition(match.getOrdered()[0]);
+        self.setCursor(match.tail);
+        self.calculateMaxColumn(match.tail);
+    }
+}
+
+pub fn handleComandModified(self: *Self) void {
+    _ = self;
 }
 
 pub fn collapseCursor(self: *Self, rope: *ed.Rope) void {
@@ -378,9 +415,15 @@ pub fn collapseCursor(self: *Self, rope: *ed.Rope) void {
     self.view.cursor.tail = new_tail;
 }
 
+pub fn calculateMaxColumn(self: *Self, position: usize) void {
+    const document = self.documents.getPtr(self.current_document) orelse return;
+    const line_range = document.rope.getLineRange(position) orelse return;
+    self.view.max_column = position - line_range[0];
+}
+
 pub fn setCursor(self: *Self, position: usize) void {
     switch (self.mode) {
-        .normal, .insert => {
+        .normal, .insert, .command, .search, .search_pattern => {
             self.view.cursor.head = position;
             self.view.cursor.tail = position;
         },
@@ -417,7 +460,6 @@ pub fn setCursor(self: *Self, position: usize) void {
             //     self.view.cursor.head = line_range[1] -| 1;
             // }
         },
-        .command, .search => @panic("invalid mode"),
     }
 }
 
@@ -648,6 +690,13 @@ pub fn commandLineInputGoForwardWord(self: *Self, dispatch: *DispatchState) void
 pub fn commandEnterSearchMode(self: *Self, dispatch: *DispatchState) void {
     _ = dispatch;
     self.mode = .search;
+    self.line_input_buffer.items.len = 0;
+    self.line_input_cursor = 0;
+}
+
+pub fn commandEnterSearchPatternMode(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
+    self.mode = .search_pattern;
     self.line_input_buffer.items.len = 0;
     self.line_input_cursor = 0;
 }
@@ -1381,15 +1430,19 @@ pub fn commandVisualSearch(self: *Self, dispatch: *DispatchState) void {
         m.setCurrent(&document.rope, range[1]);
         var match_opt = m.next();
         if (match_opt) |match| {
+            self.mode = .normal;
             self.adjustViewToCursorPosition(match.getOrdered()[0]);
-            self.view.cursor = match;
+            self.setCursor(match.tail);
+            self.calculateMaxColumn(match.tail);
         } else {
             m.wrapNext(&document.rope);
 
             match_opt = m.next();
             if (match_opt) |match| {
+                self.mode = .normal;
                 self.adjustViewToCursorPosition(match.getOrdered()[0]);
-                self.view.cursor = match;
+                self.setCursor(match.tail);
+                self.calculateMaxColumn(match.tail);
             }
         }
 
@@ -1400,13 +1453,16 @@ pub fn commandVisualSearch(self: *Self, dispatch: *DispatchState) void {
         const pattern_text = document.rope.toOwnedSlice(range[0], range[1] + 1, self.allocator);
 
         // @Robustness: memory leak
-        const pattern = ed.Pattern.parseTokenBased(pattern_text, self.allocator);
+        _ = self.pattern_arena.reset(.retain_capacity);
+        const pattern = ed.Pattern.parseLiteral(pattern_text, self.pattern_arena.allocator());
         self.matcher = document.rope.matchStartingFrom(pattern, self.view.cursor.getOrdered()[1]);
 
         const match_opt = self.matcher.?.next();
         if (match_opt) |match| {
+            self.mode = .normal;
             self.adjustViewToCursorPosition(match.getOrdered()[0]);
-            self.view.cursor = match;
+            self.setCursor(match.tail);
+            self.calculateMaxColumn(match.tail);
         }
     }
 }
@@ -1426,14 +1482,16 @@ pub fn commandVisualSearchReverse(self: *Self, dispatch: *DispatchState) void {
         var match_opt = m.prev();
         if (match_opt) |match| {
             self.adjustViewToCursorPosition(match.getOrdered()[0]);
-            self.view.cursor = match;
+            self.setCursor(match.tail);
+            self.calculateMaxColumn(match.tail);
         } else {
             m.wrapPrev(&document.rope);
 
             match_opt = m.prev();
             if (match_opt) |match| {
                 self.adjustViewToCursorPosition(match.getOrdered()[0]);
-                self.view.cursor = match;
+                self.setCursor(match.tail);
+                self.calculateMaxColumn(match.tail);
             }
         }
 
@@ -1445,13 +1503,15 @@ pub fn commandVisualSearchReverse(self: *Self, dispatch: *DispatchState) void {
         const pattern_text = document.rope.toOwnedSlice(range[0], range[1] + 1, self.allocator);
 
         // @Robustness: memory leak
-        const pattern = ed.Pattern.parseTokenBased(pattern_text, self.allocator);
+        _ = self.pattern_arena.reset(.retain_capacity);
+        const pattern = ed.Pattern.parseLiteral(pattern_text, self.pattern_arena.allocator());
         self.matcher = document.rope.matchStartingFrom(pattern, self.view.cursor.getOrdered()[1]);
 
         const match_opt = self.matcher.?.prev();
         if (match_opt) |match| {
             self.adjustViewToCursorPosition(match.getOrdered()[0]);
-            self.view.cursor = match;
+            self.setCursor(match.tail);
+            self.calculateMaxColumn(match.tail);
         }
     }
 }
@@ -1465,16 +1525,16 @@ pub fn commandVisualSearchNext(self: *Self, dispatch: *DispatchState) void {
         var match_opt = m.next();
         if (match_opt) |match| {
             self.adjustViewToCursorPosition(match.getOrdered()[0]);
-            self.view.cursor = match;
-            self.mode = .visual;
+            self.setCursor(match.tail);
+            self.calculateMaxColumn(match.tail);
         } else {
             m.wrapNext(&document.rope);
 
             match_opt = m.next();
             if (match_opt) |match| {
                 self.adjustViewToCursorPosition(match.getOrdered()[0]);
-                self.view.cursor = match;
-                self.mode = .visual;
+                self.setCursor(match.tail);
+                self.calculateMaxColumn(match.tail);
             }
         }
     }
@@ -1489,16 +1549,16 @@ pub fn commandVisualSearchPrev(self: *Self, dispatch: *DispatchState) void {
         var match_opt = m.prev();
         if (match_opt) |match| {
             self.adjustViewToCursorPosition(match.getOrdered()[0]);
-            self.view.cursor = match;
-            self.mode = .visual;
+            self.setCursor(match.tail);
+            self.calculateMaxColumn(match.tail);
         } else {
             m.wrapPrev(&document.rope);
 
             match_opt = m.prev();
             if (match_opt) |match| {
                 self.adjustViewToCursorPosition(match.getOrdered()[0]);
-                self.view.cursor = match;
-                self.mode = .visual;
+                self.setCursor(match.tail);
+                self.calculateMaxColumn(match.tail);
             }
         }
     }
@@ -1924,6 +1984,13 @@ pub fn render(self: *Self, area: ed.Rect, renderer: *ed.Renderer) void {
         const current_document = self.documents.getPtr(self.current_document).?;
         var text_iterator = current_document.rope.iterUtf16StartingFrom(&output_buffer, self.view.start_position);
 
+        var matcher: ?ed.Rope.MatcherImpl(.{ .upper_line_bound = true }) = null;
+        if (self.matcher) |m| {
+            matcher = m.toBounded(&current_document.rope, self.view.start_position, self.view.lines);
+        }
+        var current_match: ?ed.View.Selection = if (self.matcher != null) matcher.?.next() else null;
+        var current_match_is_dirty = false;
+
         const bg_color_ = ed.Color.init(40, 40, 60);
         var current_char_offset: usize = self.view.start_position;
 
@@ -1958,14 +2025,32 @@ pub fn render(self: *Self, area: ed.Rect, renderer: *ed.Renderer) void {
                     .visual => .block,
                     .visual_line => .block,
                     .search => .underline,
+                    .search_pattern => .underline,
                     .command => .underline,
                 };
                 renderer.set_cursor_style(.init(0xff, 0xdd, 0x33), bg_color);
-            } else if (self.view.cursor.containsPosition(current_char_offset)) {
-                bg_color = .red;
+            }
+
+            // --------- Background Highlighting ---------
+            if (current_match) |match| {
+                if (match.containsPosition(current_char_offset)) {
+                    current_match_is_dirty = true;
+                    if (cursor_kind != .block) {
+                        bg_color = .init(10, 150, 200);
+                        fg_color = bg_color_;
+                    }
+                } else if (current_match_is_dirty) {
+                    current_match = matcher.?.next();
+                    current_match_is_dirty = false;
+                }
+            }
+            if (self.view.cursor.containsPosition(current_char_offset) and (self.mode == .visual or self.mode == .visual_line)) {
+                if (cursor_kind != .block) {
+                    bg_color = .red;
+                }
             } else if (self.last_yanked_range) |yank_range| {
                 if (yank_range.containsPosition(current_char_offset)) {
-                    fg_color = bg_color;
+                    fg_color = bg_color_;
                     bg_color = .green;
                 }
             }
@@ -2010,7 +2095,7 @@ pub fn render(self: *Self, area: ed.Rect, renderer: *ed.Renderer) void {
         y = @truncate(area.bottom - 2);
 
         switch (self.mode) {
-            .search, .command => {
+            .search, .search_pattern, .command => {
                 x = status_x_coord;
                 const bg_color = ed.Color.init(35, 35, 50);
 
@@ -2028,6 +2113,7 @@ pub fn render(self: *Self, area: ed.Rect, renderer: *ed.Renderer) void {
 
                 const char: u8 = switch (self.mode) {
                     .search => '/',
+                    .search_pattern => '?',
                     .command => ':',
                     else => unreachable,
                 };

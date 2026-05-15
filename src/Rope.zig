@@ -2702,102 +2702,135 @@ pub fn getTextObject(self: *Self, textobject: ed.TextObject, comptime outer: boo
     }
 }
 
-pub const Matcher = struct {
-    iterator: Iterator = .{},
-    saved_iterator: Iterator = .{},
-    pattern: *const ed.Pattern = undefined,
-    start: usize = 0,
-    end: usize = 0,
-    // position: usize = 0,
-    // position_opposite: usize = 0,
-    dir: enum { next, prev } = .next,
-
-    pub const empty = Matcher{};
-
-    pub fn setCurrent(self: *Matcher, rope: *Self, position: usize) void {
-        self.iterator = rope.iterStartingFrom(position);
-        self.start = position;
-        self.end = position;
-    }
-
-    pub fn wrapNext(self: *Matcher, rope: *Self) void {
-        self.iterator = rope.iter();
-        self.start = 0;
-        self.end = 0;
-    }
-
-    pub fn wrapPrev(self: *Matcher, rope: *Self) void {
-        self.iterator = rope.iterStartingFrom(rope.len -| 1);
-        self.start = rope.len -| 1;
-        self.end = rope.len -| 1;
-    }
-
-    pub fn next(self: *Matcher) ?ed.View.Selection {
-        if (self.dir != .next) {
-            for (self.start..self.end) |_| {
-                _ = self.iterator.nextByte();
-            }
-        }
-        self.dir = .next;
-
-        self.start = self.end;
-
-        var matched, var match_length = self.pattern.matchesWithIterator(Iterator.nextByte, &self.iterator);
-        {
-            defer self.end = self.start + match_length;
-            while (!matched) {
-                const t = self.iterator.next();
-                if (t == null) return null;
-                self.start += std.unicode.utf8CodepointSequenceLength(@truncate(t.?)) catch @panic("Invalid utf8");
-                matched, match_length = self.pattern.matchesWithIterator(Iterator.nextByte, &self.iterator);
-            }
-        }
-
-        return .{ .head = self.end -| 1, .tail = self.start };
-    }
-
-    pub fn prev(self: *Matcher) ?ed.View.Selection {
-        if (self.dir != .prev) {
-            for (self.start..self.end) |_| {
-                _ = self.iterator.prevByte();
-            }
-        }
-        self.dir = .prev;
-
-        if (self.start == 0) {
-            self.end = 0;
-            return null;
-        }
-
-        self.start -= 1;
-        self.end -= 1;
-        _ = self.iterator.prevByte();
-
-        var saved = self.iterator.save();
-        var matched, var match_length = self.pattern.matchesWithIterator(Iterator.nextByte, &self.iterator);
-        self.iterator.restore(saved);
-
-        {
-            defer self.end = self.start + match_length;
-            while (!matched) {
-                const t = self.iterator.prev();
-                if (t == null) return null;
-                self.start -= std.unicode.utf8CodepointSequenceLength(@truncate(t.?)) catch @panic("Invalid utf8");
-
-                saved = self.iterator.save();
-                matched, match_length = self.pattern.matchesWithIterator(Iterator.nextByte, &self.iterator);
-                self.iterator.restore(saved);
-            }
-        }
-
-        return .{ .head = self.end -| 1, .tail = self.start };
-    }
+pub const MatcherOptions = struct {
+    upper_line_bound: bool = false,
 };
+
+pub const Matcher = MatcherImpl(.{});
+
+pub fn MatcherImpl(options: MatcherOptions) type {
+    return struct {
+        iterator: Iterator = .{},
+        saved_iterator: Iterator = .{},
+        pattern: *const ed.Pattern = undefined,
+        start: usize = 0,
+        end: usize = 0,
+        dir: enum { next, prev } = .next,
+
+        lines: if (options.upper_line_bound) usize else void,
+        upper_line_bound: if (options.upper_line_bound) usize else void,
+
+        pub const empty = @This(){};
+
+        pub fn toBounded(self: @This(), rope: *Self, start_position: usize, line_bound: usize) MatcherImpl(.{ .upper_line_bound = true }) {
+            const result: MatcherImpl(.{ .upper_line_bound = true }) = .{
+                .pattern = self.pattern,
+                .iterator = rope.iterStartingFrom(start_position),
+                .start = start_position,
+                .end = start_position,
+                .lines = 0,
+                .upper_line_bound = line_bound,
+            };
+            return result;
+        }
+
+        pub fn setCurrent(self: *@This(), rope: *Self, position: usize) void {
+            self.iterator = rope.iterStartingFrom(position);
+            self.start = position;
+            self.end = position;
+        }
+
+        pub fn wrapNext(self: *@This(), rope: *Self) void {
+            self.iterator = rope.iter();
+            self.start = 0;
+            self.end = 0;
+        }
+
+        pub fn wrapPrev(self: *@This(), rope: *Self) void {
+            self.iterator = rope.iterStartingFrom(rope.len -| 1);
+            self.start = rope.len -| 1;
+            self.end = rope.len -| 1;
+        }
+
+        pub fn next(self: *@This()) ?ed.View.Selection {
+            if (self.dir != .next) {
+                for (self.start..self.end) |_| {
+                    _ = self.iterator.nextByte();
+                }
+                self.dir = .next;
+            }
+
+            self.start = self.end;
+
+            var matched, var match_length = self.pattern.matchesWithIterator(Iterator.nextByte, &self.iterator);
+            {
+                defer self.end = self.start + match_length;
+                while (!matched) {
+                    const t = self.iterator.next();
+                    if (t == null) return null;
+                    self.start += std.unicode.utf8CodepointSequenceLength(@truncate(t.?)) catch @panic("Invalid utf8");
+                    if (options.upper_line_bound) {
+                        switch (t.?) {
+                            '\n' => self.lines += 1,
+                            else => {},
+                        }
+
+                        if (self.lines >= self.upper_line_bound) {
+                            return null;
+                        }
+                    }
+                    matched, match_length = self.pattern.matchesWithIterator(Iterator.nextByte, &self.iterator);
+                }
+            }
+
+            return .{ .head = self.end -| 1, .tail = self.start };
+        }
+
+        pub fn prev(self: *@This()) ?ed.View.Selection {
+            if (self.dir != .prev) {
+                for (self.start..self.end) |_| {
+                    _ = self.iterator.prevByte();
+                }
+                self.dir = .prev;
+            }
+
+            if (self.start == 0) {
+                self.end = 0;
+                return null;
+            }
+
+            self.start -= 1;
+            self.end -= 1;
+            _ = self.iterator.prevByte();
+
+            var saved = self.iterator.save();
+            var matched, var match_length = self.pattern.matchesWithIterator(Iterator.nextByte, &self.iterator);
+            self.iterator.restore(saved);
+
+            {
+                defer self.end = self.start + match_length;
+                while (!matched) {
+                    const t = self.iterator.prev();
+                    if (t == null) return null;
+                    self.start -|= std.unicode.utf8CodepointSequenceLength(@truncate(t.?)) catch @panic("Invalid utf8");
+
+                    saved = self.iterator.save();
+                    matched, match_length = self.pattern.matchesWithIterator(Iterator.nextByte, &self.iterator);
+                    self.iterator.restore(saved);
+                }
+            }
+
+            return .{ .head = self.end -| 1, .tail = self.start };
+        }
+    };
+}
 
 pub fn match(self: *Self, pattern: *const ed.Pattern) Matcher {
     return .{
         .iterator = self.iter(),
         .pattern = pattern,
+        .lines = {},
+        .upper_line_bound = {},
     };
 }
 
@@ -2807,6 +2840,8 @@ pub fn matchStartingFrom(self: *Self, pattern: *const ed.Pattern, position: usiz
         .pattern = pattern,
         .start = position,
         .end = position,
+        .lines = {},
+        .upper_line_bound = {},
     };
 }
 

@@ -144,6 +144,12 @@ pub const Pattern = union(enum) {
         return result;
     }
 
+    pub fn parseLiteral(pattern: []const u8, allocator: std.mem.Allocator) *Pattern {
+        var state = TokenBasedParser{ .pattern = pattern, .allocator = allocator };
+        const literal = state.createPattern(.{ .literal = pattern });
+        return literal;
+    }
+
     pub fn format(self: *const Pattern, w: *std.Io.Writer) !void {
         try self.formatImpl(w, 0);
     }

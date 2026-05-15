@@ -47,6 +47,7 @@ pub const normal_keymap_definition = .{
     .{ 'N', "commandVisualSearchPrev" },
 
     .{ '/', "commandEnterSearchMode" },
+    .{ '?', "commandEnterSearchPatternMode" },
     .{ ':', "commandEnterCommandMode" },
 
     .{ movement, "commandMove" },
