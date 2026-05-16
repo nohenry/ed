@@ -3,6 +3,14 @@
 
 <img width="1005" height="992" alt="image" src="https://github.com/user-attachments/assets/7105beed-ac04-4945-81e2-665d73e21a99" />
 
+
+
+
+https://github.com/user-attachments/assets/eebd6a45-de3c-406b-b9da-0f773a6f7b18
+
+
+
+
 ### Noteable
 * Uses a paged, rope data structure for efficiently manipulating large text files. Rope is pretty standard, but I'm using paged to mean splitting up the text file into fixed sized chunks (a page), and only loading those pages into memory (each page is its own rope).
 * Uses a token based syntax highlighter. Most editors I've seen either use some kind of regex on the character level, or full on parsing. But I found that tokenizing the code is simpler, and produces quite comfortable highlighting.
