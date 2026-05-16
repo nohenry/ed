@@ -1,6 +1,6 @@
 # ed
-#### A VIM based text editor optimized for my text editing preferences
-
+#### A VIM based text editor, from scratch, no 3rd party libraries, optimized for my text editing preferences
+Proudly contains no AI-generated code.
 <img width="1005" height="992" alt="image" src="https://github.com/user-attachments/assets/7105beed-ac04-4945-81e2-665d73e21a99" />
 
 
