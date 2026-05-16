@@ -385,11 +385,20 @@ pub fn handleSearchModified(self: *Self) void {
     const cursor = self.search_saved_view.?.cursor;
     self.matcher = document.rope.matchStartingFrom(pattern, cursor.getOrdered()[1]);
 
-    const match_opt = self.matcher.?.next();
+    var match_opt = self.matcher.?.next();
     if (match_opt) |match| {
         self.adjustViewToCursorPosition(match.getOrdered()[0]);
         self.setCursor(match.tail);
         self.calculateMaxColumn(match.tail);
+    } else {
+        self.matcher.?.wrapNext(&document.rope);
+
+        match_opt = self.matcher.?.next();
+        if (match_opt) |match| {
+            self.adjustViewToCursorPosition(match.getOrdered()[0]);
+            self.setCursor(match.tail);
+            self.calculateMaxColumn(match.tail);
+        }
     }
 }
 
@@ -2135,8 +2144,6 @@ pub fn render(self: *Self, area: ed.Rect, renderer: *ed.Renderer) void {
                     },
                 }
             }
-        } else {
-            std.debug.print("did not break\n", .{});
         }
 
         while (y < @as(u16, @truncate(area.bottom))) : (y += 1) {
