@@ -347,7 +347,7 @@ pub const Tokenizer = struct {
         // Skip the UTF-8 BOM if present
         return Tokenizer{
             .iterator = rope.iter(),
-            .buffer_length = rope.len,
+            .buffer_length = rope.length(),
             .index = 0,
             .pending_invalid_token = null,
         };
@@ -357,7 +357,7 @@ pub const Tokenizer = struct {
         // Skip the UTF-8 BOM if present
         return Tokenizer{
             .iterator = rope.iterStartingFrom(starting_from),
-            .buffer_length = rope.len,
+            .buffer_length = rope.length(),
             .index = starting_from,
             .pending_invalid_token = null,
         };

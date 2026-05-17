@@ -40,6 +40,9 @@ pub const normal_keymap_definition = .{
     .{ .{ ctrl, 'u' }, "commandMoveUpHalfView" },
     .{ .{ ctrl, 'd' }, "commandMoveDownHalfView" },
 
+    .{ .{ ctrl, 'a' }, "commandIncrementUnderCursor" },
+    .{ .{ ctrl, 'x' }, "commandDecrementUnderCursor" },
+
     .{ '>', "commandIndentIn" },
     .{ '<', "commandIndentOut" },
 

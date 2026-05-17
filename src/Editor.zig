@@ -53,6 +53,9 @@ line_input_buffer: std.ArrayList(u8) = .empty,
 line_input_cursor: usize = 0,
 line_input_view_start: usize = 0,
 
+key_events: std.ArrayList(ed.KeyDownEvent) = .empty,
+clear_key_event_next: bool = false,
+
 pub const ApplicationVtable = struct {
     start_timer: *const fn (data: *anyopaque, id: ed.TimerId, milliseconds: usize) void,
     kill_timer: *const fn (data: *anyopaque, id: ed.TimerId) void,
@@ -162,9 +165,36 @@ pub fn testMotionLCSplit(self: *Self, key_event: []const ed.KeyDownEvent, tail_l
     try std.testing.expectEqual(tail_column, tlc.column);
 }
 
+pub inline fn clearKeyEvents(self: *Self) void {
+    self.key_events.items.len = 0;
+}
+
+pub inline fn pushKeyEvent(self: *Self, event: ed.KeyDownEvent) void {
+    self.key_events.append(self.allocator, event) catch @panic("OOM");
+}
+
+pub inline fn pushKeyDispatchResult(self: *Self, event: ed.KeyDownEvent, dispatch_result: keymap.DispatchResult) void {
+    switch (dispatch_result) {
+        .not_mapped => {
+            self.clearKeyEvents();
+        },
+        .waiting => {
+            self.pushKeyEvent(event);
+        },
+        .dispatched_command => {
+            self.pushKeyEvent(event);
+            self.clear_key_event_next = true;
+        },
+    }
+}
+
 pub fn handleEvent(self: *Self, event: ed.Event) void {
     switch (event) {
         .key_down => {
+            if (self.clear_key_event_next) {
+                self.clearKeyEvents();
+                self.clear_key_event_next = false;
+            }
             switch (self.mode) {
                 .insert => self.handleInsertModeKeydown(event),
                 .normal => self.handleNormalModeKeydown(event),
@@ -200,13 +230,12 @@ pub fn handleInsertModeKeydown(self: *Self, event: ed.Event) void {
             var out: [4]u8 = undefined;
             const utf8_len = std.unicode.utf8Encode(@truncate(data.char), &out) catch @panic("invlaid utf8");
             node.appendSlice(self.allocator, out[0..utf8_len]) catch @panic("OOM");
-            document.rope.len += utf8_len;
             self.view.cursor.head += utf8_len;
             self.view.cursor.tail += utf8_len;
             self.view.max_column += utf8_len;
         },
         .delete => {
-            if (self.view.cursor.head < document.rope.len) {
+            if (self.view.cursor.head < document.rope.length()) {
                 self.saved_insert_node = null;
                 if (self.saved_delete_node) |delete_node| {
                     _ = delete_node;
@@ -264,7 +293,8 @@ pub fn handleNormalModeKeydown(self: *Self, event: ed.Event) void {
             if (data.key == .char and data.char == 'q') {
                 self.quit();
             } else if (data.key == .char and (data.char & 0x7F) == data.char) {
-                _ = keymap.dispatchNormalCommand(&self.key_dispatch_state, (@as(u16, @as(u3, @bitCast(data.modifers))) << 7) | @as(u7, @truncate(data.char)), self);
+                const result = keymap.dispatchNormalCommand(&self.key_dispatch_state, (@as(u16, @as(u3, @bitCast(data.modifers))) << 7) | @as(u7, @truncate(data.char)), self);
+                self.pushKeyDispatchResult(data, result);
             }
         },
         .escape => {
@@ -282,7 +312,8 @@ pub fn handleVisualModeKeydown(self: *Self, event: ed.Event) void {
     switch (data.key) {
         .char => {
             if (data.key == .char and (data.char & 0x7F) == data.char) {
-                _ = keymap.dispatchVisualCommand(&self.key_dispatch_state, (@as(u16, @as(u3, @bitCast(data.modifers))) << 7) | @as(u7, @truncate(data.char)), self);
+                const result = keymap.dispatchVisualCommand(&self.key_dispatch_state, (@as(u16, @as(u3, @bitCast(data.modifers))) << 7) | @as(u7, @truncate(data.char)), self);
+                self.pushKeyDispatchResult(data, result);
             }
         },
         .escape => {
@@ -552,7 +583,7 @@ pub fn moveCursorDown(self: *Self, line_count: u32, comptime move_cursor: bool) 
     );
 
     const max_pos = document.rope.sub(
-        document.rope.len - 1,
+        document.rope.length() - 1,
         ed.Rope.Coordinate{ .line = self.view.lines - 2, .column = 0 },
         ed.Rope.Position,
     );
@@ -581,7 +612,7 @@ pub fn adjustViewToCursorPosition(self: *Self, cursor_position: usize) void {
     const line_range = document.rope.getLineRange(new_start_position) orelse return;
 
     const max_pos = document.rope.sub(
-        document.rope.len - 1,
+        document.rope.length() - 1,
         ed.Rope.Coordinate{ .line = self.view.lines - 2, .column = 0 },
         ed.Rope.Position,
     );
@@ -903,7 +934,7 @@ pub fn commandFindTillPrevious(self: *Self, dispatch: *DispatchState) void {
         node, node_offset = node.previousNodeChar(node_offset) orelse break;
     }
 
-    if (found and current_offset + 1 < document.rope.len) self.setCursor(current_offset + 1);
+    if (found and current_offset + 1 < document.rope.length()) self.setCursor(current_offset + 1);
 }
 
 pub fn commandFindAgainNext(self: *Self, dispatch: *DispatchState) void {
@@ -997,6 +1028,91 @@ pub fn commandDeleteUnder(self: *Self, dispatch: *DispatchState) void {
     _ = document.rope.deleteRange(ordered[0], ordered[1] + 1);
 }
 
+/// Dry
+pub fn modifyNumberUnderCursor(self: *Self, comptime modification: enum { inc, dec }) void {
+    const document = self.documents.getPtr(self.current_document) orelse return;
+    const view_end = document.rope.add(
+        self.view.start_position,
+        ed.Rope.Coordinate{ .line = self.view.lines + 1, .column = 0 },
+        ed.Rope.Position,
+    );
+    var current_offset = self.view.cursor.head;
+    var node, var node_offset = document.rope.indexNode(current_offset) orelse return;
+
+    var negate = false;
+    if (std.ascii.isDigit(node.string.items[node_offset])) {
+        while (current_offset > 0) : (current_offset -= 1) {
+            switch (node.string.items[node_offset]) {
+                '0'...'9' => {},
+                '-' => {
+                    negate = true;
+                    break;
+                },
+                else => {
+                    current_offset += 1;
+                    node, node_offset = node.nextNodeChar(node_offset) orelse break;
+                    break;
+                },
+            }
+            node, node_offset = node.previousNodeChar(node_offset) orelse break;
+        }
+    }
+
+    var start = current_offset;
+
+    var found = false;
+    var accumulator: isize = 0;
+    while (current_offset < view_end) : (current_offset += 1) {
+        switch (node.string.items[node_offset]) {
+            '0'...'9' => |c| {
+                accumulator *= 10;
+                accumulator += (c - '0');
+                if (!found) start = current_offset;
+                found = true;
+            },
+            '-' => {
+                if (found) {
+                    std.debug.assert(current_offset > 0);
+                    current_offset -= 1;
+                    break;
+                }
+                negate = true;
+                start = current_offset;
+                found = true;
+            },
+            else => {
+                if (found) {
+                    std.debug.assert(current_offset > 0);
+                    current_offset -= 1;
+                    break;
+                }
+            },
+        }
+        node, node_offset = node.nextNodeChar(node_offset) orelse break;
+    }
+
+    if (found) {
+        const lhs, _, _, _ = document.rope.deleteRange(start, current_offset + 1) orelse return;
+        if (negate) accumulator *= -1;
+        const new_value = switch (modification) {
+            .inc => accumulator + 1,
+            .dec => accumulator - 1,
+        };
+        const size = lhs.print(document.rope.allocator, "{}", .{new_value}) catch @panic("OOM");
+        self.setCursor(start + size - 1);
+    }
+}
+
+pub fn commandIncrementUnderCursor(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
+    self.modifyNumberUnderCursor(.inc);
+}
+
+pub fn commandDecrementUnderCursor(self: *Self, dispatch: *DispatchState) void {
+    _ = dispatch;
+    self.modifyNumberUnderCursor(.dec);
+}
+
 pub fn commandChangeMovement(self: *Self, dispatch: *DispatchState) void {
     const movement_result = self.calculateKeyMovementQuery(dispatch.movement.?, dispatch.chars(), .select) orelse return;
     const document = self.documents.getPtr(self.current_document) orelse return;
@@ -1077,7 +1193,7 @@ pub fn commandPasteAfter(self: *Self, dispatch: *DispatchState) void {
         _ = document.rope.insertString(line_range[1], text);
         self.setCursor(line_range[1]);
     } else {
-        _ = document.rope.insertString(@min(self.view.cursor.head + 1, document.rope.len), text);
+        _ = document.rope.insertString(@min(self.view.cursor.head + 1, document.rope.length()), text);
     }
 }
 
@@ -1835,7 +1951,7 @@ pub fn calculateKeyMovementQuery(self: *Self, movement: Movement, chars: []const
             var current_offset = line_range[0];
             var current_node, var current_node_offset = document.rope.indexNode(line_range[0]).?;
 
-            while (current_offset < document.rope.len) : (current_offset += 1) {
+            while (current_offset < document.rope.length()) : (current_offset += 1) {
                 switch (current_node.string.items[current_node_offset]) {
                     ' ', '\t', '\r' => {},
                     else => break,
@@ -1974,7 +2090,7 @@ pub fn findCharacter(self: *Self, rope: *ed.Rope, character: u8, comptime forwar
         ed.Rope.Position,
     );
     var current_offset = if (forwards)
-        @min(self.view.cursor.head + 1, rope.len)
+        @min(self.view.cursor.head + 1, rope.length())
     else
         self.view.cursor.head -| 1;
     var node, var node_offset = rope.indexNode(current_offset) orelse return null;
@@ -2003,7 +2119,7 @@ pub fn findCharacter(self: *Self, rope: *ed.Rope, character: u8, comptime forwar
             if (forwards) {
                 return if (current_offset > 0) current_offset - 1 else null;
             } else {
-                return if (current_offset + 1 < rope.len) current_offset + 1 else null;
+                return if (current_offset + 1 < rope.length()) current_offset + 1 else null;
             }
         }
 
@@ -2110,12 +2226,12 @@ pub fn render(self: *Self, area: ed.Rect, renderer: *ed.Renderer) void {
             }
             if (self.view.cursor.containsPosition(current_char_offset) and (self.mode == .visual or self.mode == .visual_line)) {
                 if (cursor_kind != .block) {
-                    bg_color = .red;
+                    bg_color = ed.SyntaxHighlighter.Highlight.light_gray;
                 }
             } else if (self.last_yanked_range) |yank_range| {
                 if (yank_range.containsPosition(current_char_offset)) {
                     fg_color = bg_color_;
-                    bg_color = .green;
+                    bg_color = ed.SyntaxHighlighter.Highlight.green;
                 }
             }
             // --------- End Highlighting ---------
@@ -2153,9 +2269,45 @@ pub fn render(self: *Self, area: ed.Rect, renderer: *ed.Renderer) void {
             }
         }
 
-        var number_buf: [16]u8 = undefined;
-        const number = std.fmt.bufPrint(&number_buf, "{:6}", .{self.view.cursor.head}) catch @panic("buffer to small!");
-        const number_x_coord = @as(u16, @truncate(area.right)) - @as(u16, @truncate(number.len)) - 2;
+        var key_events = std.ArrayList(u8).initCapacity(self.scratch.allocator(), 128) catch @panic("OOM");
+        key_events.append(self.scratch.allocator(), ' ') catch @panic("OOM");
+        for (self.key_events.items) |ev| {
+            if (ev.modifers.ctrl > 0) {
+                key_events.appendSlice(self.scratch.allocator(), "ctl-") catch @panic("OOM");
+            }
+            if (ev.modifers.alt > 0) {
+                key_events.appendSlice(self.scratch.allocator(), "alt-") catch @panic("OOM");
+            }
+            switch (ev.key) {
+                .char => {
+                    key_events.append(self.scratch.allocator(), @truncate(ev.char)) catch @panic("OOM");
+                },
+                .escape => key_events.appendSlice(self.scratch.allocator(), "esc") catch @panic("OOM"),
+                .backspace => key_events.appendSlice(self.scratch.allocator(), "back") catch @panic("OOM"),
+                .enter => key_events.appendSlice(self.scratch.allocator(), "") catch @panic("OOM"),
+                .left => key_events.appendSlice(self.scratch.allocator(), "h") catch @panic("OOM"),
+                .right => key_events.appendSlice(self.scratch.allocator(), "l") catch @panic("OOM"),
+                .up => key_events.appendSlice(self.scratch.allocator(), "k") catch @panic("OOM"),
+                .down => key_events.appendSlice(self.scratch.allocator(), "j") catch @panic("OOM"),
+                .home => key_events.appendSlice(self.scratch.allocator(), "home") catch @panic("OOM"),
+                .end => key_events.appendSlice(self.scratch.allocator(), "end") catch @panic("OOM"),
+                .page_up => key_events.appendSlice(self.scratch.allocator(), "pg-up") catch @panic("OOM"),
+                .page_down => key_events.appendSlice(self.scratch.allocator(), "pg-down") catch @panic("OOM"),
+                .tab => key_events.appendSlice(self.scratch.allocator(), "tab") catch @panic("OOM"),
+                .delete => key_events.appendSlice(self.scratch.allocator(), "del") catch @panic("OOM"),
+                .insert => key_events.appendSlice(self.scratch.allocator(), "ins") catch @panic("OOM"),
+                .scroll_lock => key_events.appendSlice(self.scratch.allocator(), "scrl") catch @panic("OOM"),
+                .num_lock => key_events.appendSlice(self.scratch.allocator(), "num") catch @panic("OOM"),
+                .print_screen => key_events.appendSlice(self.scratch.allocator(), "print") catch @panic("OOM"),
+                .pause => key_events.appendSlice(self.scratch.allocator(), "pause") catch @panic("OOM"),
+            }
+        }
+        key_events.appendNTimes(self.scratch.allocator(), ' ', 6 -| key_events.items.len) catch @panic("OOM");
+
+        //var number_buf: [16]u8 = undefined;
+        //const number = std.fmt.bufPrint(&number_buf, "{:6}", .{self.view.cursor.head}) catch @panic("buffer to small!");
+        //const number_x_coord = @as(u16, @truncate(area.right)) - @as(u16, @truncate(number.len)) - 2;
+        const number_x_coord = @as(u16, @truncate(area.right)) - @as(u16, @truncate(key_events.items.len)) - 2;
         const status_x_coord: u16 = @truncate(area.left);
         y = @truncate(area.bottom - 2);
 
@@ -2227,7 +2379,11 @@ pub fn render(self: *Self, area: ed.Rect, renderer: *ed.Renderer) void {
         }
 
         x = number_x_coord;
-        for (number) |c| {
+        //for (number) |c| {
+        //    renderer.place_glyph(x, y, &.{@as(u16, c)}, .white, .init(20, 20, 20), .init(0, 0, 0), .none, .hidden);
+        //    x += 1;
+        //}
+        for (key_events.items) |c| {
             renderer.place_glyph(x, y, &.{@as(u16, c)}, .white, .init(20, 20, 20), .init(0, 0, 0), .none, .hidden);
             x += 1;
         }

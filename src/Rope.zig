@@ -378,13 +378,24 @@ pub const GrowableString = struct {
         @memcpy(self.items[old_len..][0..items.len], items);
     }
 
-    pub fn print(self: *GrowableString, gpa: Allocator, comptime fmt: []const u8, args: anytype) error{OutOfMemory}!void {
+    pub fn print(self: *GrowableString, gpa: Allocator, comptime fmt: []const u8, args: anytype) error{OutOfMemory}!usize {
         try self.ensureUnusedCapacity(gpa, fmt.len);
-        var aw: std.Io.Writer.Allocating = .fromArrayList(gpa, self);
-        defer self.* = aw.toArrayList();
-        return aw.writer.print(fmt, args) catch |err| switch (err) {
+        var s = std.ArrayList(u8){
+            .capacity = self.capacity,
+            .items = self.items,
+        };
+        const old_len = s.items.len;
+        var aw: std.Io.Writer.Allocating = .fromArrayList(gpa, &s);
+        defer {
+            const al = aw.toArrayList();
+            self.capacity = al.capacity;
+            self.items = al.items;
+        }
+        aw.writer.print(fmt, args) catch |err| switch (err) {
             error.WriteFailed => return error.OutOfMemory,
         };
+        std.debug.assert(old_len <= aw.writer.end);
+        return aw.writer.end - old_len;
     }
 
     pub fn printAssumeCapacity(self: *GrowableString, comptime fmt: []const u8, args: anytype) void {
@@ -1066,7 +1077,7 @@ pub const Node = struct {
         return self.string.appendSliceAssumeCapacity(items);
     }
 
-    pub inline fn print(self: *Node, gpa: Allocator, comptime fmt: []const u8, args: anytype) error{OutOfMemory}!void {
+    pub inline fn print(self: *Node, gpa: Allocator, comptime fmt: []const u8, args: anytype) error{OutOfMemory}!usize {
         std.debug.assert(self.isLeaf());
         const old_len = self.string.items.len;
         defer self.setLen(old_len, self.string.items.len);
@@ -1333,7 +1344,6 @@ pub const Node = struct {
 allocator: std.mem.Allocator,
 node_pool: std.heap.MemoryPool(Node),
 root: ?*Node,
-len: usize = 0,
 balance_state: usize = 0,
 
 pub fn init(allocator: std.mem.Allocator) Self {
@@ -1344,6 +1354,10 @@ pub fn init(allocator: std.mem.Allocator) Self {
     };
 }
 
+pub inline fn length(self: *const Self) usize {
+    return if (self.root) |r| r.total_length else 0;
+}
+
 pub fn loadEmpty(self: *Self) void {
     const node = self.node_pool.create(self.allocator) catch @panic("OOM");
     node.* = .{
@@ -1351,7 +1365,6 @@ pub fn loadEmpty(self: *Self) void {
         .total_length = 0,
     };
     self.root = node;
-    self.len = 0;
 }
 
 pub fn loadString(self: *Self, string: []const u8) void {
@@ -1363,7 +1376,6 @@ pub fn loadString(self: *Self, string: []const u8) void {
         .total_length = string.len,
     };
     self.root = node;
-    self.len = string.len;
 }
 
 pub fn createNode(self: *Self, left: ?*Node, right: ?*Node) *Node {
@@ -1470,10 +1482,9 @@ pub fn insertString(self: *Self, index: usize, string: []const u8) *Node {
 
     const allocated_string = Node.String.initReadonly(string);
 
-    defer self.len += string.len;
     if (index == 0) {
         return self.prependString(allocated_string);
-    } else if (index == self.len) {
+    } else if (index == self.length()) {
         return self.appendString(allocated_string);
     }
 
@@ -1498,10 +1509,9 @@ pub fn insertGrowableString(self: *Self, index: usize, string: GrowableString) *
     std.debug.assert(self.root != null);
     const current = self.root.?;
 
-    defer self.len += string.items.len;
     if (index == 0) {
         return self.prependString(string);
-    } else if (index == self.len) {
+    } else if (index == self.length()) {
         return self.appendString(string);
     }
 
@@ -1532,10 +1542,9 @@ pub fn insertSplat(self: *Self, index: usize, char: u8, count: usize) *Node {
         a.* = char;
     }
 
-    defer self.len += count;
     if (index == 0) {
         return self.prependString(allocated_string);
-    } else if (index == self.len) {
+    } else if (index == self.length()) {
         return self.appendString(allocated_string);
     }
 
@@ -1550,6 +1559,11 @@ pub fn insertSplat(self: *Self, index: usize, char: u8, count: usize) *Node {
     self.root = self.createNode(lhs, rhs);
 
     return leaf_node;
+}
+
+pub fn setTotalNodeLength(self: *Self, node: *Node, len: usize) void {
+    _ = self;
+    node.setLen(node.string.items.len, len);
 }
 
 fn prependString(self: *Self, string: Node.String) *Node {
@@ -1630,12 +1644,12 @@ pub fn deleteRange(self: *Self, start: usize, end: usize) ?struct { *Node, *Node
     }
     const lhs_existing = current;
 
-    self.len -= end - start;
     return .{ lhs_existing, lhs[1], rhs[0], rhs_existing };
 }
 
 /// Deletes one character backward
 pub fn backspaceOneWithNode(self: *Self, node: *Node) ?*Node {
+    _ = self;
     var result = node;
     while (result.string.items.len == 0) {
         result = result.previousLeaf() orelse return null;
@@ -1648,7 +1662,6 @@ pub fn backspaceOneWithNode(self: *Self, node: *Node) ?*Node {
     }
 
     result.string.items.len -= 1;
-    self.len -= 1;
     return result;
 }
 
@@ -1786,9 +1799,9 @@ pub const Iterator = struct {
         }
         const current = current_node orelse return null;
 
-        const length = std.unicode.utf8ByteSequenceLength(current.string.items[self.index]) catch @panic("invlaid utf8");
-        const codepoint = std.unicode.utf8Decode(current.string.items[self.index .. self.index + length]) catch @panic("invalid utf8");
-        defer self.index += length;
+        const codepoint_length = std.unicode.utf8ByteSequenceLength(current.string.items[self.index]) catch @panic("invlaid utf8");
+        const codepoint = std.unicode.utf8Decode(current.string.items[self.index .. self.index + codepoint_length]) catch @panic("invalid utf8");
+        defer self.index += codepoint_length;
 
         return @as(u32, codepoint);
     }
@@ -1797,8 +1810,8 @@ pub const Iterator = struct {
         const current = self.node_iter.current() orelse return null;
         const new_node, const new_index = current.previousNodeChar(self.index) orelse .{ null, 0 };
 
-        const length = std.unicode.utf8ByteSequenceLength(current.string.items[self.index]) catch @panic("invlaid utf8");
-        const codepoint = std.unicode.utf8Decode(current.string.items[self.index .. self.index + length]) catch @panic("invalid utf8");
+        const codepoint_length = std.unicode.utf8ByteSequenceLength(current.string.items[self.index]) catch @panic("invlaid utf8");
+        const codepoint = std.unicode.utf8Decode(current.string.items[self.index .. self.index + codepoint_length]) catch @panic("invalid utf8");
         defer {
             self.node_iter.current_ = new_node;
             self.index = new_index;
@@ -1843,10 +1856,10 @@ pub const Utf16Iterator = struct {
         const current = self.current_node orelse return null;
 
         const codepoint_length = std.unicode.utf8ByteSequenceLength(current.string.items[self.index]) catch @panic("invlaid utf8");
-        const length = std.unicode.utf8ToUtf16Le(self.output_buffer.*[0..], current.string.items[self.index .. self.index + codepoint_length]) catch @panic("invalid utf8");
-        defer self.index += length;
+        const utf16_length = std.unicode.utf8ToUtf16Le(self.output_buffer.*[0..], current.string.items[self.index .. self.index + codepoint_length]) catch @panic("invalid utf8");
+        defer self.index += utf16_length;
 
-        return .{ self.output_buffer.*[0..length], codepoint_length };
+        return .{ self.output_buffer.*[0..utf16_length], codepoint_length };
     }
 };
 
@@ -1987,7 +2000,7 @@ pub fn toOwnedSliceArrayList(self: *Self, start: usize, end: usize, list: *std.A
 
 /// Returns the node, and the relative string offset into the node
 pub fn indexNode(self: *Self, index: usize) ?struct { *Node, usize } {
-    if (index >= self.len) return null;
+    if (index >= self.length()) return null;
 
     var current_index = index;
     var current: ?*Node = self.root orelse return null;
@@ -2041,7 +2054,7 @@ pub fn addLineOffsetToPosition(self: *Self, position: usize, line_offset: u32) v
     var line: u32 = 0;
     var column: u32 = 0;
 
-    while (current_offset < self.len and line < line_offset) : (current_offset += 1) {
+    while (current_offset < self.length() and line < line_offset) : (current_offset += 1) {
         switch (current_node.string.items[current_node_offset]) {
             '\r' => {},
             '\n' => {
@@ -2099,7 +2112,7 @@ pub fn add(self: *Self, a: anytype, b: anytype, comptime T: type) T {
         var line: u32 = 0;
         var column: u32 = 0;
 
-        while (current_offset < self.len) : (current_offset += 1) {
+        while (current_offset < self.length()) : (current_offset += 1) {
             if (line == a.line and column == a.column) {
                 break;
             }
@@ -2120,7 +2133,7 @@ pub fn add(self: *Self, a: anytype, b: anytype, comptime T: type) T {
             current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse break;
         }
 
-        while (current_offset < b and current_offset < self.len) : (current_offset += 1) {
+        while (current_offset < b and current_offset < self.length()) : (current_offset += 1) {
             switch (current_node.string.items[current_node_offset]) {
                 '\r' => {},
                 '\n' => {
@@ -2146,7 +2159,7 @@ pub fn add(self: *Self, a: anytype, b: anytype, comptime T: type) T {
         var line: u32 = 0;
         var column: u32 = 0;
 
-        while (current_offset < self.len) : (current_offset += 1) {
+        while (current_offset < self.length()) : (current_offset += 1) {
             if (line == b.line and column == b.column) {
                 break;
             }
@@ -2166,7 +2179,7 @@ pub fn add(self: *Self, a: anytype, b: anytype, comptime T: type) T {
             current_node, current_node_offset = current_node.nextNodeChar(current_node_offset) orelse break;
         }
 
-        if (current_offset + 1 >= self.len and line != b.line) {
+        if (current_offset + 1 >= self.length() and line != b.line) {
             const line_range = self.getLineRange(current_offset).?;
             current_offset = @min(line_range[0] + b.column, line_range[1]);
         }
@@ -2299,7 +2312,7 @@ pub fn getLineRange(self: *Self, position: usize) ?struct { usize, usize } {
 
     current_node, current_node_offset = self.indexNode(position).?;
 
-    while (line_end < self.len) : (line_end += 1) {
+    while (line_end < self.length()) : (line_end += 1) {
         switch (current_node.string.items[current_node_offset]) {
             '\n' => {
                 break;
@@ -2319,7 +2332,7 @@ pub fn getNextLineRange(self: *Self, position: usize) ?struct { usize, usize } {
     var remaining_lines: u32 = 2;
     var last_line_start: usize = position;
 
-    while (current_offset < self.len) : (current_offset += 1) {
+    while (current_offset < self.length()) : (current_offset += 1) {
         switch (current_node.string.items[current_node_offset]) {
             '\r' => {},
             '\n' => {
@@ -2327,7 +2340,7 @@ pub fn getNextLineRange(self: *Self, position: usize) ?struct { usize, usize } {
                 if (remaining_lines == 0) {
                     break;
                 }
-                if (current_offset + 1 >= self.len) return null; // prevents jumping to eol at eof
+                if (current_offset + 1 >= self.length()) return null; // prevents jumping to eol at eof
                 last_line_start = current_offset + 1;
             },
             else => {},
@@ -2379,7 +2392,7 @@ pub fn getNextWord(self: *Self, position: usize) usize {
     var has_done_word = false;
     var has_done_other = false;
 
-    while (current_offset < self.len) : (current_offset += 1) {
+    while (current_offset < self.length()) : (current_offset += 1) {
         switch (current_node.string.items[current_node_offset]) {
             ' ', '\n', '\r', '\t' => {
                 has_done_whitespace = true;
@@ -2408,7 +2421,7 @@ pub fn getNextWordEnd(self: *Self, position: usize) usize {
     var has_done_word = false;
     var has_done_other = false;
 
-    while (current_offset < self.len) : (current_offset += 1) {
+    while (current_offset < self.length()) : (current_offset += 1) {
         switch (current_node.string.items[current_node_offset]) {
             ' ', '\n', '\r', '\t' => {
                 if (has_done_word or has_done_other) {
@@ -2525,7 +2538,7 @@ pub fn getTextObject(self: *Self, textobject: ed.TextObject, comptime outer: boo
                         break :blk;
                     }
 
-                    while (current_offset < self.len) : (current_offset += 1) {
+                    while (current_offset < self.length()) : (current_offset += 1) {
                         const char = current_node.string.items[current_node_offset];
                         switch (char) {
                             ' ', '\t', '\n', '\r' => {},
@@ -2544,7 +2557,7 @@ pub fn getTextObject(self: *Self, textobject: ed.TextObject, comptime outer: boo
                     continue :sw .scan_word_forward;
                 },
                 .scan_whitespace_forward => {
-                    while (current_offset < self.len) : (current_offset += 1) {
+                    while (current_offset < self.length()) : (current_offset += 1) {
                         const char = current_node.string.items[current_node_offset];
                         switch (char) {
                             ' ', '\t' => {},
@@ -2577,7 +2590,7 @@ pub fn getTextObject(self: *Self, textobject: ed.TextObject, comptime outer: boo
                     continue :sw .scan_word_forward;
                 },
                 .scan_word_forward => {
-                    while (current_offset < self.len) : (current_offset += 1) {
+                    while (current_offset < self.length()) : (current_offset += 1) {
                         const char = current_node.string.items[current_node_offset];
                         if (!obj.isValid(char)) {
                             end = current_offset;
@@ -2669,7 +2682,7 @@ pub fn getTextObject(self: *Self, textobject: ed.TextObject, comptime outer: boo
                 },
                 .scan_open_forward => {
                     level = 0;
-                    while (current_offset < self.len) : (current_offset += 1) {
+                    while (current_offset < self.length()) : (current_offset += 1) {
                         char = current_node.string.items[current_node_offset];
                         switch (char) {
                             obj.getOpen() => {
@@ -2708,7 +2721,7 @@ pub fn getTextObject(self: *Self, textobject: ed.TextObject, comptime outer: boo
                 },
                 .scan_close_forward => {
                     level = 0;
-                    while (current_offset < self.len) : (current_offset += 1) {
+                    while (current_offset < self.length()) : (current_offset += 1) {
                         char = current_node.string.items[current_node_offset];
                         switch (char) {
                             obj.getOpen() => {
@@ -2781,9 +2794,9 @@ pub fn MatcherImpl(options: MatcherOptions) type {
         }
 
         pub fn wrapPrev(self: *@This(), rope: *Self) void {
-            self.iterator = rope.iterStartingFrom(rope.len -| 1);
-            self.start = rope.len -| 1;
-            self.end = rope.len -| 1;
+            self.iterator = rope.iterStartingFrom(rope.length() -| 1);
+            self.start = rope.length() -| 1;
+            self.end = rope.length() -| 1;
         }
 
         pub fn next(self: *@This()) ?ed.View.Selection {

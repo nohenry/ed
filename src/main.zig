@@ -35,7 +35,7 @@ pub fn main2(init: std.process.Init) !void {
 
     // rope.rebalance(scratch.allocator());
     // rope.insertString(0, "foobar");
-    // rope.insertString(rope.len, "fricku");
+    // rope.insertString(rope.length(), "fricku");
 
     const pattern = ed.Pattern.parseTokenBased("the", std.heap.page_allocator);
     var matcher = rope.matchStartingFrom(pattern, 10);
